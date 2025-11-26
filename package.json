@@ -1,0 +1,26 @@
+{
+  "name": "webgpu-typescript-starter",
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@tweakpane/core": "^1.1.7",
+    "tweakpane-plugin-file-import": "^0.2.0",
+    "@webgpu/types": "^0.1.31",
+    "typescript": "^5.0.4",
+    "vite": "^4.3.1",
+    "vite-raw-plugin": "^1.0.1"
+  },
+  "dependencies": {
+    "@loaders.gl/core": "^4.2.2",
+    "@loaders.gl/ply": "^4.2.2",
+    "@petamoriken/float16": "^3.8.7",
+    "tweakpane": "^3.1.8",
+    "tweakpane-plugin-file-import": "^0.2.0",
+    "wgpu-matrix": "^3.2.0"
+  }
+}
