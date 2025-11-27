@@ -9,6 +9,7 @@ import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardWGSL from '../shaders/training-forward.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
 import trainingBackwardWGSL from '../shaders/training-backward.wgsl';
+import adamWGSL from '../shaders/adam.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
@@ -109,6 +110,14 @@ export default function get_renderer(
   let residual_alpha_view: GPUTextureView | null = null;
   let training_loss_bind_group: GPUBindGroup | null = null;
   let training_backward_bind_group: GPUBindGroup | null = null;
+
+  // Adam optimizer state
+  let adam_config_buffer: GPUBuffer | null = null;
+  let moment_sh_m1_buffer: GPUBuffer | null = null;
+  let moment_sh_m2_buffer: GPUBuffer | null = null;
+  let moment_opacity_m1_buffer: GPUBuffer | null = null;
+  let moment_opacity_m2_buffer: GPUBuffer | null = null;
+  let adam_step_counter = 0;
 
   // Training parameter buffers (float32)
   let train_position_buffer: GPUBuffer | null = null;
@@ -335,7 +344,7 @@ export default function get_renderer(
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    // (Re)create float32 training gradient buffers
+    // create float32 training gradient buffers
     grad_position_buffer = device.createBuffer({
       label: 'grad positions (float32)',
       size: newCapacity * TRAIN_POS_COMPONENTS * FLOAT32_BYTES,
@@ -359,6 +368,28 @@ export default function get_renderer(
     grad_sh_buffer = device.createBuffer({
       label: 'grad SH (float32)',
       size: newCapacity * TRAIN_SH_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+
+    // Adam moment buffers
+    moment_sh_m1_buffer = device.createBuffer({
+      label: 'adam m1 SH (float32)',
+      size: newCapacity * TRAIN_SH_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_sh_m2_buffer = device.createBuffer({
+      label: 'adam m2 SH (float32)',
+      size: newCapacity * TRAIN_SH_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_opacity_m1_buffer = device.createBuffer({
+      label: 'adam m1 opacity (float32)',
+      size: newCapacity * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_opacity_m2_buffer = device.createBuffer({
+      label: 'adam m2 opacity (float32)',
+      size: newCapacity * FLOAT32_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -390,6 +421,12 @@ export default function get_renderer(
   const settings_buffer = createSettingsBuffer();
   const indirect_args = createIndirectArgsBuffer();
   const optimize_settings_buffer = createOptimizeSettingsBuffer();
+  adam_config_buffer = createBuffer(
+    device,
+    'adam config',
+    4 * 8,
+    GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+  );
 
   function setGaussianScale(value: number) {
     device.queue.writeBuffer(settings_buffer, 0, new Float32Array([value]));
@@ -543,6 +580,15 @@ export default function get_renderer(
     compute: {
       module: device.createShaderModule({ code: commonWGSL + '\n' + trainingBackwardWGSL }),
       entryPoint: 'training_backward',
+    },
+  });
+
+  const adam_pipeline = device.createComputePipeline({
+    label: 'adam optimizer',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: adamWGSL }),
+      entryPoint: 'adam_step',
     },
   });
 
@@ -1174,6 +1220,94 @@ export default function get_renderer(
     pass.setBindGroup(0, training_backward_bind_group);
     pass.dispatchWorkgroups(num_wg);
     pass.end();
+  }
+
+  function run_adam_on_buffer(
+    encoder: GPUCommandEncoder,
+    param: GPUBuffer,
+    m1: GPUBuffer,
+    m2: GPUBuffer,
+    grad: GPUBuffer,
+    elementCount: number,
+    lr: number,
+  ) {
+    if (!adam_config_buffer) return;
+    if (elementCount <= 0) return;
+
+    const beta1 = 0.9;
+    const beta2 = 0.999;
+    const eps = 1e-8;
+
+    const t = Math.max(1, adam_step_counter);
+    const bias_correction1 = 1.0 - Math.pow(beta1, t);
+    const bias_correction2 = 1.0 - Math.pow(beta2, t);
+    const bias_correction1_rcp = 1.0 / bias_correction1;
+    const bias_correction2_sqrt_rcp = 1.0 / Math.sqrt(bias_correction2);
+
+    const cfg = new Float32Array([
+      lr,
+      beta1,
+      beta2,
+      eps,
+      bias_correction1_rcp,
+      bias_correction2_sqrt_rcp,
+      elementCount,
+      0.0,
+    ]);
+    device.queue.writeBuffer(adam_config_buffer, 0, cfg);
+
+    const bindGroup = device.createBindGroup({
+      label: 'adam bind group',
+      layout: adam_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: param } },
+        { binding: 1, resource: { buffer: m1 } },
+        { binding: 2, resource: { buffer: m2 } },
+        { binding: 3, resource: { buffer: grad } },
+        { binding: 4, resource: { buffer: adam_config_buffer } },
+      ],
+    });
+
+    const num_wg = Math.ceil(elementCount / WORKGROUP_SIZE);
+    const pass = encoder.beginComputePass({ label: 'adam step' });
+    pass.setPipeline(adam_pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  function run_adam_updates(encoder: GPUCommandEncoder) {
+    if (!train_sh_buffer || !grad_sh_buffer || !moment_sh_m1_buffer || !moment_sh_m2_buffer) return;
+    if (!train_opacity_buffer || !grad_opacity_buffer || !moment_opacity_m1_buffer || !moment_opacity_m2_buffer) return;
+
+    const sh_elements = active_count * TRAIN_SH_COMPONENTS;
+    const opacity_elements = active_count;
+
+    if (sh_elements > 0) {
+      run_adam_on_buffer(
+        encoder,
+        train_sh_buffer,
+        moment_sh_m1_buffer,
+        moment_sh_m2_buffer,
+        grad_sh_buffer,
+        sh_elements,
+        1e-2,
+      );
+    }
+
+    if (opacity_elements > 0) {
+      run_adam_on_buffer(
+        encoder,
+        train_opacity_buffer,
+        moment_opacity_m1_buffer,
+        moment_opacity_m2_buffer,
+        grad_opacity_buffer,
+        opacity_elements,
+        1e-2,
+      );
+    }
+
+    adam_step_counter += 1;
   }
 
   // ===============================================
