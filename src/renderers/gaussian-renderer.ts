@@ -2,7 +2,6 @@ import { PointCloud } from '../utils/load';
 import preprocessWGSL from '../shaders/preprocess.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import commonWGSL from '../shaders/common.wgsl';
-import optimizerWGSL from '../shaders/optimizer.wgsl';
 import knnInitWGSL from '../shaders/knn-init.wgsl';
 import pruneWGSL from '../shaders/prune.wgsl';
 import densifyWGSL from '../shaders/densify.wgsl';
@@ -138,7 +137,6 @@ export default function get_renderer(
   let sorted_bg: GPUBindGroup[] = [];
   let render_splat_bg: GPUBindGroup | null = null;
   let preprocess_bg: GPUBindGroup | null = null;
-  let optimize_bind_group: GPUBindGroup | null = null;
   let knn_init_bind_group: GPUBindGroup | null = null;
   let prune_bind_group: GPUBindGroup | null = null;
   let densify_bind_group: GPUBindGroup | null = null;
@@ -479,7 +477,6 @@ export default function get_renderer(
   function setTargetTexture(view: GPUTextureView, sampler: GPUSampler) {
     targetTextureView = view;
     targetSampler = sampler;
-    rebuildOptimizerBG();
     rebuildDensifyBG();
   }
 
@@ -496,15 +493,6 @@ export default function get_renderer(
         workgroupSize: WORKGROUP_SIZE,
         sortKeyPerThread: (C.histogram_wg_size * C.rs_histogram_block_rows) / WORKGROUP_SIZE,
       },
-    },
-  });
-
-  const optimizer_pipeline = device.createComputePipeline({
-    label: 'optimizer',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: commonWGSL + '\n' + optimizerWGSL }),
-      entryPoint: 'optimizer',
     },
   });
 
@@ -711,48 +699,6 @@ export default function get_renderer(
     });
   }
 
-  function rebuildOptimizerBG() {
-    if (!gaussian_buffer || !sh_buffer || !splat_buffer || !density_buffer ||
-        !active_count_uniform_buffer || !optimize_settings_buffer) {
-      return;
-    }
-
-    const camera_buffer_to_use = training_camera_buffers.length > 0
-      ? training_camera_buffers[current_training_camera_index]
-      : camera_buffer;
-    
-    let texture_view_to_use: GPUTextureView;
-    let sampler_to_use: GPUSampler;
-    
-    if (training_images.length > 0 && current_training_camera_index < training_images.length) {
-      texture_view_to_use = training_images[current_training_camera_index].view;
-      sampler_to_use = training_images[current_training_camera_index].sampler;
-    } else if (targetTextureView && targetSampler) {
-      texture_view_to_use = targetTextureView;
-      sampler_to_use = targetSampler;
-    } else {
-      return;
-    }
-    
-    optimize_bind_group = device.createBindGroup({
-      label: 'optimizer bind group',
-      layout: optimizer_pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: gaussian_buffer } },
-        { binding: 1, resource: { buffer: optimize_settings_buffer } },
-        { binding: 2, resource: sampler_to_use },
-        { binding: 3, resource: texture_view_to_use },
-        { binding: 4, resource: { buffer: splat_buffer } },
-        { binding: 5, resource: { buffer: sh_buffer } },
-        { binding: 6, resource: { buffer: camera_buffer } },
-        // Does not work with training cameras due to missing R and T matrices in Skyfall-GS training dataset, using camera buffer as hacky workaround
-        //{ binding: 6, resource: { buffer: camera_buffer_to_use } },
-        { binding: 7, resource: { buffer: settings_buffer } },
-        { binding: 8, resource: { buffer: density_buffer } },
-        { binding: 9, resource: { buffer: active_count_uniform_buffer } },
-      ]
-    });
-  }
 
   function rebuildKnnInitBG() {
     if (!gaussian_buffer || !density_buffer) return;
@@ -912,7 +858,6 @@ export default function get_renderer(
     rebuildSortedBG();
     rebuildRenderSplatBG();
     rebuildPreprocessBG();
-    rebuildOptimizerBG();
     rebuildKnnInitBG();
     rebuildPruneBG();
     rebuildDensifyBG();
@@ -1313,31 +1258,40 @@ export default function get_renderer(
   // ===============================================
   // Training
   // ===============================================
-  function trainStep(encoder: GPUCommandEncoder) {
-    if (!optimize_bind_group) {
-      console.warn("Optimizer has no bind group");
-      return;
+  function zeroGradBuffers() {
+    if (!grad_sh_buffer || !grad_opacity_buffer) return;
+    const sh_elements = capacity * TRAIN_SH_COMPONENTS;
+    const opacity_elements = capacity;
+    if (sh_elements > 0) {
+      device.queue.writeBuffer(grad_sh_buffer, 0, new Float32Array(sh_elements));
     }
-    
+    if (opacity_elements > 0) {
+      device.queue.writeBuffer(grad_opacity_buffer, 0, new Float32Array(opacity_elements));
+    }
+  }
+
+  function trainStep(encoder: GPUCommandEncoder) {
+    // Choose current training camera index for logging / loss target selection
     if (training_camera_buffers.length > 0) {
       current_training_camera_index = trainingIteration % training_camera_buffers.length;
-      rebuildOptimizerBG();
     }
-    
+
     trainingIteration++;
     const cameraInfo = training_camera_buffers.length > 0 
       ? ` (camera ${current_training_camera_index + 1}/${training_camera_buffers.length}${training_images.length > 0 ? `, image ${current_training_camera_index + 1}/${training_images.length}` : ''})` 
       : '';
     console.log(`Training iteration ${trainingIteration}${cameraInfo}...`);
-    setActiveCount(active_count);
 
-    const num = active_count;
-    const num_wg = Math.ceil(num / WORKGROUP_SIZE);
-    const pass = encoder.beginComputePass({ label: 'optimize splats pass' });
-    pass.setPipeline(optimizer_pipeline);
-    pass.setBindGroup(0, optimize_bind_group);
-    pass.dispatchWorkgroups(num_wg);
-    pass.end();
+    setActiveCount(active_count);
+    zeroGradBuffers();
+
+    // Forward -> Loss -> Backward -> Adam
+    run_training_forward(encoder);
+    run_training_loss(encoder);
+    run_training_backward(encoder);
+    run_adam_updates(encoder);
+
+    camera.needsPreprocess = true;
   }
 
   function train(numFrames: number) {
@@ -1363,14 +1317,11 @@ export default function get_renderer(
     );
     
     current_training_camera_index = 0;
-    rebuildOptimizerBG();
-    
     console.log(`Loaded ${cameras.length} training cameras`);
   }
 
   function setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>) {
     training_images = images;
-    rebuildOptimizerBG();
     
     console.log(`Loaded ${images.length} training images`);
     if (training_cameras.length > 0 && images.length !== training_cameras.length) {
