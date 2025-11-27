@@ -8,6 +8,7 @@ import pruneWGSL from '../shaders/prune.wgsl';
 import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardWGSL from '../shaders/training-forward.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
+import trainingBackwardWGSL from '../shaders/training-backward.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
@@ -107,6 +108,7 @@ export default function get_renderer(
   let residual_color_view: GPUTextureView | null = null;
   let residual_alpha_view: GPUTextureView | null = null;
   let training_loss_bind_group: GPUBindGroup | null = null;
+  let training_backward_bind_group: GPUBindGroup | null = null;
 
   // Training parameter buffers (float32)
   let train_position_buffer: GPUBuffer | null = null;
@@ -535,6 +537,15 @@ export default function get_renderer(
     },
   });
 
+  const training_backward_pipeline = device.createComputePipeline({
+    label: 'training backward',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingBackwardWGSL }),
+      entryPoint: 'training_backward',
+    },
+  });
+
   // ===============================================
   // Bind Group Creation Functions
   // ===============================================
@@ -826,6 +837,30 @@ export default function get_renderer(
     });
   }
 
+  function rebuildTrainingBackwardBG() {
+    if (!gaussian_buffer || !grad_sh_buffer || !grad_opacity_buffer ||
+        !residual_color_view || !residual_alpha_view ||
+        !active_count_uniform_buffer) {
+      return;
+    }
+
+    training_backward_bind_group = device.createBindGroup({
+      label: 'training backward bind group',
+      layout: training_backward_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: camera_buffer } },
+        { binding: 1, resource: { buffer: settings_buffer } },
+        { binding: 2, resource: { buffer: gaussian_buffer } },
+        { binding: 3, resource: { buffer: sh_buffer } },
+        { binding: 4, resource: residual_color_view },
+        { binding: 5, resource: residual_alpha_view },
+        { binding: 6, resource: { buffer: grad_sh_buffer } },
+        { binding: 7, resource: { buffer: grad_opacity_buffer } },
+        { binding: 8, resource: { buffer: active_count_uniform_buffer } },
+      ],
+    });
+  }
+
   function rebuildAllBindGroups() {
     rebuildSorterBG();
     rebuildSortedBG();
@@ -837,6 +872,7 @@ export default function get_renderer(
     rebuildDensifyBG();
     rebuildTrainingForwardBG();
     rebuildTrainingLossBG();
+    rebuildTrainingBackwardBG();
   }
 
   // ===============================================
@@ -1120,6 +1156,23 @@ export default function get_renderer(
     pass.setPipeline(training_loss_pipeline);
     pass.setBindGroup(0, training_loss_bind_group);
     pass.dispatchWorkgroups(numGroupsX, numGroupsY);
+    pass.end();
+  }
+
+  function run_training_backward(encoder: GPUCommandEncoder) {
+    if (!training_backward_bind_group) return;
+
+    ensureTrainingRenderTargets(canvas.width, canvas.height);
+    rebuildTrainingBackwardBG();
+
+    const num = active_count;
+    if (num === 0) return;
+    const num_wg = Math.ceil(num / WORKGROUP_SIZE);
+
+    const pass = encoder.beginComputePass({ label: 'training backward' });
+    pass.setPipeline(training_backward_pipeline);
+    pass.setBindGroup(0, training_backward_bind_group);
+    pass.dispatchWorkgroups(num_wg);
     pass.end();
   }
 
