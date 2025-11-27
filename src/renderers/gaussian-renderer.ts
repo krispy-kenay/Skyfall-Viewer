@@ -6,6 +6,7 @@ import optimizerWGSL from '../shaders/optimizer.wgsl';
 import knnInitWGSL from '../shaders/knn-init.wgsl';
 import pruneWGSL from '../shaders/prune.wgsl';
 import densifyWGSL from '../shaders/densify.wgsl';
+import trainingForwardWGSL from '../shaders/training-forward.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
@@ -90,6 +91,15 @@ export default function get_renderer(
   let densify_split_threshold_buffer: GPUBuffer | null = null;
   let densify_clone_threshold_buffer: GPUBuffer | null = null;
 
+  // Training forward render targets
+  let training_color_texture: GPUTexture | null = null;
+  let training_alpha_texture: GPUTexture | null = null;
+  let training_color_view: GPUTextureView | null = null;
+  let training_alpha_view: GPUTextureView | null = null;
+  let training_forward_bind_group: GPUBindGroup | null = null;
+  let training_width = 0;
+  let training_height = 0;
+
   // Training parameter buffers (float32)
   let train_position_buffer: GPUBuffer | null = null;
   let train_scale_buffer: GPUBuffer | null = null;
@@ -145,7 +155,7 @@ export default function get_renderer(
       device,
       'gaussian indirect args',
       4 * 4,
-      GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
+      GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
       new Uint32Array([6, 0, 0, 0])
     );
   }
@@ -377,6 +387,8 @@ export default function get_renderer(
 
   function resizeViewport(w: number, h: number) {
     device.queue.writeBuffer(settings_buffer, 2 * 4, new Float32Array([w, h]));
+    ensureTrainingRenderTargets(w, h);
+    rebuildTrainingForwardBG();
   }
 
   function setActiveCount(value: number) {
@@ -497,6 +509,15 @@ export default function get_renderer(
     primitive: { topology: 'triangle-list' },
   });
 
+  const training_forward_pipeline = device.createComputePipeline({
+    label: 'training forward',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingForwardWGSL }),
+      entryPoint: 'training_forward',
+    },
+  });
+
   // ===============================================
   // Bind Group Creation Functions
   // ===============================================
@@ -514,6 +535,34 @@ export default function get_renderer(
     layout: render_pipeline.getBindGroupLayout(3),
     entries: [{ binding: 0, resource: { buffer: settings_buffer } }],
   });
+
+  function ensureTrainingRenderTargets(width: number, height: number) {
+    if (training_color_texture && training_alpha_texture && training_width === width && training_height === height) {
+      return;
+    }
+
+    training_color_texture?.destroy();
+    training_alpha_texture?.destroy();
+
+    training_width = width;
+    training_height = height;
+
+    training_color_texture = device.createTexture({
+      label: 'training color (rgba32float)',
+      size: { width, height },
+      format: 'rgba32float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+    training_alpha_texture = device.createTexture({
+      label: 'training alpha (r32float)',
+      size: { width, height },
+      format: 'r32float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+
+    training_color_view = training_color_texture.createView();
+    training_alpha_view = training_alpha_texture.createView();
+  }
 
   function rebuildSorterBG() {
     if (!sorter) return;
@@ -689,6 +738,24 @@ export default function get_renderer(
     });
   }
 
+  function rebuildTrainingForwardBG() {
+    if (!splat_buffer || !sorter) return;
+    ensureTrainingRenderTargets(canvas.width, canvas.height);
+
+    training_forward_bind_group = device.createBindGroup({
+      label: 'training forward bind group',
+      layout: training_forward_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: settings_buffer } },
+        { binding: 1, resource: { buffer: splat_buffer } },
+        { binding: 2, resource: { buffer: sorter.ping_pong[sorter.final_out_index].sort_indices_buffer } },
+        { binding: 3, resource: { buffer: indirect_args } },
+        { binding: 4, resource: training_color_view! },
+        { binding: 5, resource: training_alpha_view! },
+      ],
+    });
+  }
+
   function rebuildAllBindGroups() {
     rebuildSorterBG();
     rebuildSortedBG();
@@ -698,6 +765,7 @@ export default function get_renderer(
     rebuildKnnInitBG();
     rebuildPruneBG();
     rebuildDensifyBG();
+    rebuildTrainingForwardBG();
   }
 
   // ===============================================
@@ -945,6 +1013,25 @@ export default function get_renderer(
     pass.dispatchWorkgroups(num_wg);
     pass.end();
     encoder.copyBufferToBuffer(sorter.sort_info_buffer, 0, indirect_args, 4, 4);
+  }
+
+  function run_training_forward(encoder: GPUCommandEncoder) {
+    if (!training_forward_bind_group || !splat_buffer || !sorter) return;
+
+    // Ensure render targets match current viewport
+    ensureTrainingRenderTargets(canvas.width, canvas.height);
+    rebuildTrainingForwardBG();
+
+    const wgSizeX = 8;
+    const wgSizeY = 8;
+    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
+    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+
+    const pass = encoder.beginComputePass({ label: 'training forward' });
+    pass.setPipeline(training_forward_pipeline);
+    pass.setBindGroup(0, training_forward_bind_group);
+    pass.dispatchWorkgroups(numGroupsX, numGroupsY);
+    pass.end();
   }
 
   // ===============================================
