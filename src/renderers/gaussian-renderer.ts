@@ -7,6 +7,7 @@ import knnInitWGSL from '../shaders/knn-init.wgsl';
 import pruneWGSL from '../shaders/prune.wgsl';
 import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardWGSL from '../shaders/training-forward.wgsl';
+import trainingLossWGSL from '../shaders/training-loss.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
@@ -99,6 +100,13 @@ export default function get_renderer(
   let training_forward_bind_group: GPUBindGroup | null = null;
   let training_width = 0;
   let training_height = 0;
+
+  // Training residuals (loss / backward)
+  let residual_color_texture: GPUTexture | null = null;
+  let residual_alpha_texture: GPUTexture | null = null;
+  let residual_color_view: GPUTextureView | null = null;
+  let residual_alpha_view: GPUTextureView | null = null;
+  let training_loss_bind_group: GPUBindGroup | null = null;
 
   // Training parameter buffers (float32)
   let train_position_buffer: GPUBuffer | null = null;
@@ -518,6 +526,15 @@ export default function get_renderer(
     },
   });
 
+  const training_loss_pipeline = device.createComputePipeline({
+    label: 'training loss',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: trainingLossWGSL }),
+      entryPoint: 'training_loss',
+    },
+  });
+
   // ===============================================
   // Bind Group Creation Functions
   // ===============================================
@@ -537,12 +554,16 @@ export default function get_renderer(
   });
 
   function ensureTrainingRenderTargets(width: number, height: number) {
-    if (training_color_texture && training_alpha_texture && training_width === width && training_height === height) {
+    if (training_color_texture && training_alpha_texture &&
+        residual_color_texture && residual_alpha_texture &&
+        training_width === width && training_height === height) {
       return;
     }
 
     training_color_texture?.destroy();
     training_alpha_texture?.destroy();
+    residual_color_texture?.destroy();
+    residual_alpha_texture?.destroy();
 
     training_width = width;
     training_height = height;
@@ -562,6 +583,22 @@ export default function get_renderer(
 
     training_color_view = training_color_texture.createView();
     training_alpha_view = training_alpha_texture.createView();
+
+    residual_color_texture = device.createTexture({
+      label: 'training residual color (rgba32float)',
+      size: { width, height },
+      format: 'rgba32float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+    residual_alpha_texture = device.createTexture({
+      label: 'training residual alpha (r32float)',
+      size: { width, height },
+      format: 'r32float',
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+
+    residual_color_view = residual_color_texture.createView();
+    residual_alpha_view = residual_alpha_texture.createView();
   }
 
   function rebuildSorterBG() {
@@ -756,6 +793,39 @@ export default function get_renderer(
     });
   }
 
+  function rebuildTrainingLossBG() {
+    if (!training_color_view || !training_alpha_view ||
+        !residual_color_view || !residual_alpha_view) {
+      return;
+    }
+
+    let texture_view_to_use: GPUTextureView;
+    let sampler_to_use: GPUSampler;
+
+    if (training_images.length > 0 && current_training_camera_index < training_images.length) {
+      texture_view_to_use = training_images[current_training_camera_index].view;
+      sampler_to_use = training_images[current_training_camera_index].sampler;
+    } else if (targetTextureView && targetSampler) {
+      texture_view_to_use = targetTextureView;
+      sampler_to_use = targetSampler;
+    } else {
+      return;
+    }
+
+    training_loss_bind_group = device.createBindGroup({
+      label: 'training loss bind group',
+      layout: training_loss_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sampler_to_use },
+        { binding: 1, resource: texture_view_to_use },
+        { binding: 2, resource: training_color_view },
+        { binding: 3, resource: training_alpha_view },
+        { binding: 4, resource: residual_color_view },
+        { binding: 5, resource: residual_alpha_view },
+      ],
+    });
+  }
+
   function rebuildAllBindGroups() {
     rebuildSorterBG();
     rebuildSortedBG();
@@ -766,6 +836,7 @@ export default function get_renderer(
     rebuildPruneBG();
     rebuildDensifyBG();
     rebuildTrainingForwardBG();
+    rebuildTrainingLossBG();
   }
 
   // ===============================================
@@ -1030,6 +1101,24 @@ export default function get_renderer(
     const pass = encoder.beginComputePass({ label: 'training forward' });
     pass.setPipeline(training_forward_pipeline);
     pass.setBindGroup(0, training_forward_bind_group);
+    pass.dispatchWorkgroups(numGroupsX, numGroupsY);
+    pass.end();
+  }
+
+  function run_training_loss(encoder: GPUCommandEncoder) {
+    if (!training_loss_bind_group) return;
+
+    ensureTrainingRenderTargets(canvas.width, canvas.height);
+    rebuildTrainingLossBG();
+
+    const wgSizeX = 8;
+    const wgSizeY = 8;
+    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
+    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+
+    const pass = encoder.beginComputePass({ label: 'training loss' });
+    pass.setPipeline(training_loss_pipeline);
+    pass.setBindGroup(0, training_loss_bind_group);
     pass.dispatchWorkgroups(numGroupsX, numGroupsY);
     pass.end();
   }

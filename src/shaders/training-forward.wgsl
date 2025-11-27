@@ -12,8 +12,8 @@ struct DrawIndirectArgs {
 
 @group(0) @binding(3) var<storage, read> draw_args : DrawIndirectArgs;
 
-@group(0) @binding(4) var training_color : texture_storage_2d<rgba32float, write>;
-@group(0) @binding(5) var training_alpha : texture_storage_2d<r32float, write>;
+@group(0) @binding(4) var training_color : texture_storage_2d<rgba32float, read_write>;
+@group(0) @binding(5) var training_alpha : texture_storage_2d<r32float, read_write>;
 
 @compute @workgroup_size(8, 8, 1)
 fn training_forward(@builtin(global_invocation_id) gid : vec3<u32>) {
