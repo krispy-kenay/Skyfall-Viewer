@@ -32,6 +32,15 @@ const WORKGROUP_SIZE = 256;
 const PRUNE_INTERVAL = 70;
 const DENSIFY_INTERVAL = 100;
 
+// Float32 training parameter layout
+const FLOAT32_BYTES = 4;
+const TRAIN_POS_COMPONENTS = 3;
+const TRAIN_SCALE_COMPONENTS = 3;
+const TRAIN_ROT_COMPONENTS = 4;
+const TRAIN_OPACITY_COMPONENTS = 1;
+const TRAIN_MAX_SH_COEFFS = 16;
+const TRAIN_SH_COMPONENTS = TRAIN_MAX_SH_COEFFS * 3;
+
 const nextPow2 = (n: number) => 1 << Math.ceil(Math.log2(Math.max(1, n)));
 
 // Utility to create GPU buffers
@@ -80,6 +89,20 @@ export default function get_renderer(
   let prune_input_count_buffer: GPUBuffer | null = null;
   let densify_split_threshold_buffer: GPUBuffer | null = null;
   let densify_clone_threshold_buffer: GPUBuffer | null = null;
+
+  // Training parameter buffers (float32)
+  let train_position_buffer: GPUBuffer | null = null;
+  let train_scale_buffer: GPUBuffer | null = null;
+  let train_rotation_buffer: GPUBuffer | null = null;
+  let train_opacity_buffer: GPUBuffer | null = null;
+  let train_sh_buffer: GPUBuffer | null = null;
+
+  // Training gradient buffers (float32)
+  let grad_position_buffer: GPUBuffer | null = null;
+  let grad_scale_buffer: GPUBuffer | null = null;
+  let grad_rotation_buffer: GPUBuffer | null = null;
+  let grad_opacity_buffer: GPUBuffer | null = null;
+  let grad_sh_buffer: GPUBuffer | null = null;
 
   // Bind Groups
   let sort_bind_group: GPUBindGroup | null = null;
@@ -264,6 +287,60 @@ export default function get_renderer(
     gaussian_buffer_temp = createGaussianBuffer(newCapacity);
     sh_buffer_temp = createSHBuffer(newCapacity);
     density_buffer_temp = createDensityBuffer(newCapacity);
+
+    // create float32 training parameter buffers
+    train_position_buffer = device.createBuffer({
+      label: 'train positions (float32)',
+      size: newCapacity * TRAIN_POS_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    train_scale_buffer = device.createBuffer({
+      label: 'train scales (float32)',
+      size: newCapacity * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    train_rotation_buffer = device.createBuffer({
+      label: 'train rotations (float32)',
+      size: newCapacity * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    train_opacity_buffer = device.createBuffer({
+      label: 'train opacities (float32)',
+      size: newCapacity * TRAIN_OPACITY_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    train_sh_buffer = device.createBuffer({
+      label: 'train SH (float32)',
+      size: newCapacity * TRAIN_SH_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+
+    // (Re)create float32 training gradient buffers
+    grad_position_buffer = device.createBuffer({
+      label: 'grad positions (float32)',
+      size: newCapacity * TRAIN_POS_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    grad_scale_buffer = device.createBuffer({
+      label: 'grad scales (float32)',
+      size: newCapacity * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    grad_rotation_buffer = device.createBuffer({
+      label: 'grad rotations (float32)',
+      size: newCapacity * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    grad_opacity_buffer = device.createBuffer({
+      label: 'grad opacities (float32)',
+      size: newCapacity * TRAIN_OPACITY_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    grad_sh_buffer = device.createBuffer({
+      label: 'grad SH (float32)',
+      size: newCapacity * TRAIN_SH_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
 
     // Create active count buffers if they don't exist
     if (!active_count_buffer || !active_count_uniform_buffer) {
