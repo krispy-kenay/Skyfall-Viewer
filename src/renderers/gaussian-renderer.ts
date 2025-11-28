@@ -8,6 +8,7 @@ import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardWGSL from '../shaders/training-forward.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
 import trainingBackwardWGSL from '../shaders/training-backward.wgsl';
+import trainingParamsWGSL from '../shaders/training-params.wgsl';
 import adamWGSL from '../shaders/adam.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
@@ -109,6 +110,8 @@ export default function get_renderer(
   let residual_alpha_view: GPUTextureView | null = null;
   let training_loss_bind_group: GPUBindGroup | null = null;
   let training_backward_bind_group: GPUBindGroup | null = null;
+  let training_init_params_bind_group: GPUBindGroup | null = null;
+  let training_apply_params_bind_group: GPUBindGroup | null = null;
 
   // Adam optimizer state
   let adam_config_buffer: GPUBuffer | null = null;
@@ -177,30 +180,6 @@ export default function get_renderer(
     );
   }
 
-  function createOptimizeSettingsBuffer(): GPUBuffer {
-    const scene_extent = pc_data.scene_extent || 100.0;
-    const typical_mean_dist = scene_extent * 0.05;
-    const typical_density_target_pixels = (typical_mean_dist / 3.0) / 0.003;
-    const min_size_scaled = 0.1;
-    const max_size_scaled = typical_density_target_pixels * 8.0;
-
-    return createBuffer(
-      device,
-      'optimizer settings',
-      4 * 8,
-      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      new Float32Array([
-        0.1,   // learning_rate_color
-        0.02,   // learning_rate_alpha
-        0.02,   // min_alpha
-        0.98,   // max_alpha
-        0.05,   // learning_rate_size
-        min_size_scaled,
-        max_size_scaled,
-        0.05    // target_error
-      ])
-    );
-  }
 
   function createSplatBuffer(size: number): GPUBuffer {
     return device.createBuffer({
@@ -418,7 +397,6 @@ export default function get_renderer(
   // ===============================================
   const settings_buffer = createSettingsBuffer();
   const indirect_args = createIndirectArgsBuffer();
-  const optimize_settings_buffer = createOptimizeSettingsBuffer();
   adam_config_buffer = createBuffer(
     device,
     'adam config',
@@ -568,6 +546,28 @@ export default function get_renderer(
     compute: {
       module: device.createShaderModule({ code: commonWGSL + '\n' + trainingBackwardWGSL }),
       entryPoint: 'training_backward',
+    },
+  });
+
+  const training_params_module = device.createShaderModule({
+    code: commonWGSL + '\n' + trainingParamsWGSL,
+  });
+
+  const training_init_params_pipeline = device.createComputePipeline({
+    label: 'training params init',
+    layout: 'auto',
+    compute: {
+      module: training_params_module,
+      entryPoint: 'training_init_params',
+    },
+  });
+
+  const training_apply_params_pipeline = device.createComputePipeline({
+    label: 'training params apply',
+    layout: 'auto',
+    compute: {
+      module: training_params_module,
+      entryPoint: 'training_apply_params',
     },
   });
 
@@ -802,6 +802,7 @@ export default function get_renderer(
       return;
     }
 
+    // Use training images as targets if available; fallback to viewer target.
     let texture_view_to_use: GPUTextureView;
     let sampler_to_use: GPUSampler;
 
@@ -809,9 +810,11 @@ export default function get_renderer(
       texture_view_to_use = training_images[current_training_camera_index].view;
       sampler_to_use = training_images[current_training_camera_index].sampler;
     } else if (targetTextureView && targetSampler) {
+      // Fallback: viewer camera target
       texture_view_to_use = targetTextureView;
       sampler_to_use = targetSampler;
     } else {
+      console.warn('No training images or viewer target texture set for training loss.');
       return;
     }
 
@@ -831,7 +834,7 @@ export default function get_renderer(
 
   function rebuildTrainingBackwardBG() {
     if (!gaussian_buffer || !grad_sh_buffer || !grad_opacity_buffer ||
-        !residual_color_view || !residual_alpha_view ||
+        !residual_color_view ||
         !active_count_uniform_buffer) {
       return;
     }
@@ -845,10 +848,45 @@ export default function get_renderer(
         { binding: 2, resource: { buffer: gaussian_buffer } },
         { binding: 3, resource: { buffer: sh_buffer } },
         { binding: 4, resource: residual_color_view },
-        { binding: 5, resource: residual_alpha_view },
         { binding: 6, resource: { buffer: grad_sh_buffer } },
         { binding: 7, resource: { buffer: grad_opacity_buffer } },
         { binding: 8, resource: { buffer: active_count_uniform_buffer } },
+      ],
+    });
+  }
+
+  function rebuildTrainingInitParamsBG() {
+    if (!gaussian_buffer || !sh_buffer || !train_opacity_buffer || !train_sh_buffer || !active_count_uniform_buffer) {
+      return;
+    }
+
+    training_init_params_bind_group = device.createBindGroup({
+      label: 'training init params bind group',
+      layout: training_init_params_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gaussian_buffer } },
+        { binding: 1, resource: { buffer: sh_buffer } },
+        { binding: 2, resource: { buffer: train_opacity_buffer } },
+        { binding: 3, resource: { buffer: train_sh_buffer } },
+        { binding: 4, resource: { buffer: active_count_uniform_buffer } },
+      ],
+    });
+  }
+
+  function rebuildTrainingApplyParamsBG() {
+    if (!gaussian_buffer || !sh_buffer || !train_opacity_buffer || !train_sh_buffer || !active_count_uniform_buffer) {
+      return;
+    }
+
+    training_apply_params_bind_group = device.createBindGroup({
+      label: 'training apply params bind group',
+      layout: training_apply_params_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gaussian_buffer } },
+        { binding: 1, resource: { buffer: sh_buffer } },
+        { binding: 2, resource: { buffer: train_opacity_buffer } },
+        { binding: 3, resource: { buffer: train_sh_buffer } },
+        { binding: 4, resource: { buffer: active_count_uniform_buffer } },
       ],
     });
   }
@@ -862,8 +900,8 @@ export default function get_renderer(
     rebuildPruneBG();
     rebuildDensifyBG();
     rebuildTrainingForwardBG();
-    rebuildTrainingLossBG();
-    rebuildTrainingBackwardBG();
+    rebuildTrainingInitParamsBG();
+    rebuildTrainingApplyParamsBG();
   }
 
   // ===============================================
@@ -907,6 +945,8 @@ export default function get_renderer(
       sh_buffer!, 0,
       new_pc.num_points * BYTES_PER_SH
     );
+    rebuildTrainingInitParamsBG();
+    run_training_init_params(encoder);
     device.queue.submit([encoder.finish()]);
 
     rebuildPreprocessBG();
@@ -1133,10 +1173,12 @@ export default function get_renderer(
   }
 
   function run_training_loss(encoder: GPUCommandEncoder) {
-    if (!training_loss_bind_group) return;
-
     ensureTrainingRenderTargets(canvas.width, canvas.height);
     rebuildTrainingLossBG();
+    if (!training_loss_bind_group) {
+      console.warn('training_loss_bind_group is null, skipping training_loss dispatch');
+      return;
+    }
 
     const wgSizeX = 8;
     const wgSizeY = 8;
@@ -1151,13 +1193,18 @@ export default function get_renderer(
   }
 
   function run_training_backward(encoder: GPUCommandEncoder) {
-    if (!training_backward_bind_group) return;
-
     ensureTrainingRenderTargets(canvas.width, canvas.height);
     rebuildTrainingBackwardBG();
 
     const num = active_count;
-    if (num === 0) return;
+    if (!training_backward_bind_group) {
+      console.warn('training_backward_bind_group is null, skipping training_backward dispatch');
+      return;
+    }
+    if (num === 0) {
+      console.warn('No active gaussians, skipping training_backward dispatch');
+      return;
+    }
     const num_wg = Math.ceil(num / WORKGROUP_SIZE);
 
     const pass = encoder.beginComputePass({ label: 'training backward' });
@@ -1236,7 +1283,7 @@ export default function get_renderer(
         moment_sh_m2_buffer,
         grad_sh_buffer,
         sh_elements,
-        1e-2,
+        5e-1, // SH learning rate
       );
     }
 
@@ -1248,11 +1295,44 @@ export default function get_renderer(
         moment_opacity_m2_buffer,
         grad_opacity_buffer,
         opacity_elements,
-        1e-2,
+        5e-1, // Opacity learning rate
       );
     }
 
     adam_step_counter += 1;
+  }
+
+  function run_training_init_params(encoder: GPUCommandEncoder) {
+    if (!training_init_params_bind_group) return;
+    const num = active_count;
+    if (num === 0) return;
+    const num_wg = Math.ceil(num / WORKGROUP_SIZE);
+
+    const pass = encoder.beginComputePass({ label: 'training init params' });
+    pass.setPipeline(training_init_params_pipeline);
+    pass.setBindGroup(0, training_init_params_bind_group);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  function run_training_apply_params(encoder: GPUCommandEncoder) {
+    if (!training_apply_params_bind_group) {
+      console.warn('training_apply_params_bind_group is null, skipping apply dispatch');
+      return;
+    }
+    const num = active_count;
+    if (num === 0) {
+      console.warn('No active gaussians, skipping apply params dispatch');
+      return;
+    }
+    const num_wg = Math.ceil(num / WORKGROUP_SIZE);
+    console.log('[run_training_apply_params] dispatching', num_wg, 'workgroups for', num, 'gaussians');
+
+    const pass = encoder.beginComputePass({ label: 'training apply params' });
+    pass.setPipeline(training_apply_params_pipeline);
+    pass.setBindGroup(0, training_apply_params_bind_group);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
   }
 
   // ===============================================
@@ -1290,6 +1370,8 @@ export default function get_renderer(
     run_training_loss(encoder);
     run_training_backward(encoder);
     run_adam_updates(encoder);
+    rebuildTrainingApplyParamsBG();
+    run_training_apply_params(encoder);
 
     camera.needsPreprocess = true;
   }

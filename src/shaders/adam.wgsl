@@ -1,12 +1,12 @@
 struct AdamConfig {
-    lr                  : f32,
-    beta1               : f32,
-    beta2               : f32,
-    eps                 : f32,
-    bias_correction1_rcp: f32,
+    lr                       : f32,
+    beta1                    : f32,
+    beta2                    : f32,
+    eps                      : f32,
+    bias_correction1_rcp     : f32,
     bias_correction2_sqrt_rcp: f32,
-    element_count       : u32,
-    _pad                : u32,
+    element_count            : f32,
+    _pad                     : f32,
 };
 
 @group(0) @binding(0) var<storage, read_write> param : array<f32>;
@@ -18,7 +18,7 @@ struct AdamConfig {
 @compute @workgroup_size(256)
 fn adam_step(@builtin(global_invocation_id) gid : vec3<u32>) {
     let idx = gid.x;
-    if (idx >= cfg.element_count) {
+    if (f32(idx) >= cfg.element_count) {
         return;
     }
 

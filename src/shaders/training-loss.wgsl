@@ -19,7 +19,7 @@ fn training_loss(@builtin(global_invocation_id) gid : vec3<u32>) {
     let uv = vec2<f32>(u, v);
 
     // Predicted image from training forward pass
-    let pred = textureLoad(training_color, vec2<i32>(i32(gid.x), i32(gid.y)), 0).rgb;
+    let pred = textureLoad(training_color, vec2<i32>(i32(gid.x), i32(gid.y))).rgb;
 
     // Target image from dataset
     let targ = textureSampleLevel(targetTex, samp, uv, 0.0).rgb;
@@ -28,7 +28,7 @@ fn training_loss(@builtin(global_invocation_id) gid : vec3<u32>) {
     let diff = pred - targ;
 
     // Alpha residual = 0 for now
-    let _alpha_pred = textureLoad(training_alpha, vec2<i32>(i32(gid.x), i32(gid.y)), 0).r;
+    let _alpha_pred = textureLoad(training_alpha, vec2<i32>(i32(gid.x), i32(gid.y))).r;
     let alpha_residual = 0.0;
 
     textureStore(residual_color, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(diff, 0.0));

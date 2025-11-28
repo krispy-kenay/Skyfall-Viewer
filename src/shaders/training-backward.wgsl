@@ -5,7 +5,6 @@
 @group(0) @binding(3) var<storage, read> sh_buffer : array<u32>;
 
 @group(0) @binding(4) var residual_color : texture_storage_2d<rgba32float, read>;
-@group(0) @binding(5) var residual_alpha : texture_storage_2d<r32float, read>;
 
 @group(0) @binding(6) var<storage, read_write> grad_sh : array<f32>;
 @group(0) @binding(7) var<storage, read_write> grad_opacity : array<f32>;
@@ -97,7 +96,7 @@ fn training_backward(@builtin(global_invocation_id) gid : vec3<u32>) {
     let py = clamp(i32(uv.y * f32(dims.y)), 0, i32(dims.y - 1));
 
     // Residual
-    let res = textureLoad(residual_color, vec2<i32>(px, py), 0).rgb;
+    let res = textureLoad(residual_color, vec2<i32>(px, py)).rgb;
 
     let viewDir = normalize(-(camera.view * position_world).xyz);
     let x = viewDir.x;
