@@ -119,6 +119,12 @@ export default function get_renderer(
   let moment_sh_m2_buffer: GPUBuffer | null = null;
   let moment_opacity_m1_buffer: GPUBuffer | null = null;
   let moment_opacity_m2_buffer: GPUBuffer | null = null;
+  let moment_position_m1_buffer: GPUBuffer | null = null;
+  let moment_position_m2_buffer: GPUBuffer | null = null;
+  let moment_scale_m1_buffer: GPUBuffer | null = null;
+  let moment_scale_m2_buffer: GPUBuffer | null = null;
+  let moment_rotation_m1_buffer: GPUBuffer | null = null;
+  let moment_rotation_m2_buffer: GPUBuffer | null = null;
   let adam_step_counter = 0;
 
   // Training parameter buffers (float32)
@@ -367,6 +373,37 @@ export default function get_renderer(
     moment_opacity_m2_buffer = device.createBuffer({
       label: 'adam m2 opacity (float32)',
       size: newCapacity * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+
+    moment_position_m1_buffer = device.createBuffer({
+      label: 'adam m1 position (float32)',
+      size: newCapacity * TRAIN_POS_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_position_m2_buffer = device.createBuffer({
+      label: 'adam m2 position (float32)',
+      size: newCapacity * TRAIN_POS_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_scale_m1_buffer = device.createBuffer({
+      label: 'adam m1 scale (float32)',
+      size: newCapacity * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_scale_m2_buffer = device.createBuffer({
+      label: 'adam m2 scale (float32)',
+      size: newCapacity * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_rotation_m1_buffer = device.createBuffer({
+      label: 'adam m1 rotation (float32)',
+      size: newCapacity * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    moment_rotation_m2_buffer = device.createBuffer({
+      label: 'adam m2 rotation (float32)',
+      size: newCapacity * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -834,6 +871,7 @@ export default function get_renderer(
 
   function rebuildTrainingBackwardBG() {
     if (!gaussian_buffer || !grad_sh_buffer || !grad_opacity_buffer ||
+        !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer ||
         !residual_color_view ||
         !active_count_uniform_buffer) {
       return;
@@ -851,12 +889,18 @@ export default function get_renderer(
         { binding: 6, resource: { buffer: grad_sh_buffer } },
         { binding: 7, resource: { buffer: grad_opacity_buffer } },
         { binding: 8, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 9, resource: { buffer: grad_position_buffer } },
+        { binding: 10, resource: { buffer: grad_scale_buffer } },
+        { binding: 11, resource: { buffer: grad_rotation_buffer } },
       ],
     });
   }
 
   function rebuildTrainingInitParamsBG() {
-    if (!gaussian_buffer || !sh_buffer || !train_opacity_buffer || !train_sh_buffer || !active_count_uniform_buffer) {
+    if (!gaussian_buffer || !sh_buffer ||
+        !train_opacity_buffer || !train_sh_buffer ||
+        !train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+        !active_count_uniform_buffer) {
       return;
     }
 
@@ -869,12 +913,18 @@ export default function get_renderer(
         { binding: 2, resource: { buffer: train_opacity_buffer } },
         { binding: 3, resource: { buffer: train_sh_buffer } },
         { binding: 4, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 5, resource: { buffer: train_position_buffer } },
+        { binding: 6, resource: { buffer: train_scale_buffer } },
+        { binding: 7, resource: { buffer: train_rotation_buffer } },
       ],
     });
   }
 
   function rebuildTrainingApplyParamsBG() {
-    if (!gaussian_buffer || !sh_buffer || !train_opacity_buffer || !train_sh_buffer || !active_count_uniform_buffer) {
+    if (!gaussian_buffer || !sh_buffer ||
+        !train_opacity_buffer || !train_sh_buffer ||
+        !train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+        !active_count_uniform_buffer) {
       return;
     }
 
@@ -887,6 +937,9 @@ export default function get_renderer(
         { binding: 2, resource: { buffer: train_opacity_buffer } },
         { binding: 3, resource: { buffer: train_sh_buffer } },
         { binding: 4, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 5, resource: { buffer: train_position_buffer } },
+        { binding: 6, resource: { buffer: train_scale_buffer } },
+        { binding: 7, resource: { buffer: train_rotation_buffer } },
       ],
     });
   }
@@ -1271,9 +1324,21 @@ export default function get_renderer(
   function run_adam_updates(encoder: GPUCommandEncoder) {
     if (!train_sh_buffer || !grad_sh_buffer || !moment_sh_m1_buffer || !moment_sh_m2_buffer) return;
     if (!train_opacity_buffer || !grad_opacity_buffer || !moment_opacity_m1_buffer || !moment_opacity_m2_buffer) return;
+    if (!train_position_buffer || !grad_position_buffer || !moment_position_m1_buffer || !moment_position_m2_buffer) return;
+    if (!train_scale_buffer || !grad_scale_buffer || !moment_scale_m1_buffer || !moment_scale_m2_buffer) return;
+    if (!train_rotation_buffer || !grad_rotation_buffer || !moment_rotation_m1_buffer || !moment_rotation_m2_buffer) return;
 
     const sh_elements = active_count * TRAIN_SH_COMPONENTS;
     const opacity_elements = active_count;
+    const pos_elements = active_count * TRAIN_POS_COMPONENTS;
+    const scale_elements = active_count * TRAIN_SCALE_COMPONENTS;
+    const rot_elements = active_count * TRAIN_ROT_COMPONENTS;
+
+    const lr_means = 1.6e-5;
+    const lr_sh = 2.5e-3;
+    const lr_opacity = 5e-2;
+    const lr_scale = 5e-3;
+    const lr_rotation = 1e-3;
 
     if (sh_elements > 0) {
       run_adam_on_buffer(
@@ -1283,7 +1348,7 @@ export default function get_renderer(
         moment_sh_m2_buffer,
         grad_sh_buffer,
         sh_elements,
-        5e-1, // SH learning rate
+        lr_sh,
       );
     }
 
@@ -1295,7 +1360,43 @@ export default function get_renderer(
         moment_opacity_m2_buffer,
         grad_opacity_buffer,
         opacity_elements,
-        5e-1, // Opacity learning rate
+        lr_opacity,
+      );
+    }
+
+    if (pos_elements > 0) {
+      run_adam_on_buffer(
+        encoder,
+        train_position_buffer,
+        moment_position_m1_buffer,
+        moment_position_m2_buffer,
+        grad_position_buffer,
+        pos_elements,
+        lr_means,
+      );
+    }
+
+    if (scale_elements > 0) {
+      run_adam_on_buffer(
+        encoder,
+        train_scale_buffer,
+        moment_scale_m1_buffer,
+        moment_scale_m2_buffer,
+        grad_scale_buffer,
+        scale_elements,
+        lr_scale,
+      );
+    }
+
+    if (rot_elements > 0) {
+      run_adam_on_buffer(
+        encoder,
+        train_rotation_buffer,
+        moment_rotation_m1_buffer,
+        moment_rotation_m2_buffer,
+        grad_rotation_buffer,
+        rot_elements,
+        lr_rotation,
       );
     }
 
@@ -1339,14 +1440,27 @@ export default function get_renderer(
   // Training
   // ===============================================
   function zeroGradBuffers() {
-    if (!grad_sh_buffer || !grad_opacity_buffer) return;
+    if (!grad_sh_buffer || !grad_opacity_buffer ||
+        !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer) return;
     const sh_elements = capacity * TRAIN_SH_COMPONENTS;
     const opacity_elements = capacity;
+    const pos_elements = capacity * TRAIN_POS_COMPONENTS;
+    const scale_elements = capacity * TRAIN_SCALE_COMPONENTS;
+    const rot_elements = capacity * TRAIN_ROT_COMPONENTS;
     if (sh_elements > 0) {
       device.queue.writeBuffer(grad_sh_buffer, 0, new Float32Array(sh_elements));
     }
     if (opacity_elements > 0) {
       device.queue.writeBuffer(grad_opacity_buffer, 0, new Float32Array(opacity_elements));
+    }
+    if (pos_elements > 0) {
+      device.queue.writeBuffer(grad_position_buffer, 0, new Float32Array(pos_elements));
+    }
+    if (scale_elements > 0) {
+      device.queue.writeBuffer(grad_scale_buffer, 0, new Float32Array(scale_elements));
+    }
+    if (rot_elements > 0) {
+      device.queue.writeBuffer(grad_rotation_buffer, 0, new Float32Array(rot_elements));
     }
   }
 
