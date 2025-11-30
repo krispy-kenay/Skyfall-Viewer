@@ -27,17 +27,20 @@ export class CameraControl {
   private rotating = false;
   private lastX: number;
   private lastY: number;
-  private zoomSpeed = 0.1;
-  private panSpeed = 0.002;
-  private rotateSpeed = 0.003;
 
   downCallback(event: PointerEvent) {
     if (!event.isPrimary) {
       return;
     }
     this.camera.unlock_training_camera();
-    this.panning = event.button === 0;
-    this.rotating = event.button === 2;
+
+    if (event.button === 0) {
+      this.rotating = true;
+      this.panning = false;
+    } else {
+      this.rotating = false;
+      this.panning = true;
+    }
     this.lastX = event.pageX;
     this.lastY = event.pageY;
   }
@@ -46,55 +49,43 @@ export class CameraControl {
       return;
     }
 
-    const dx = event.pageX - this.lastX;
-    const dy = event.pageY - this.lastY;
+    const xDelta = event.pageX - this.lastX;
+    const yDelta = event.pageY - this.lastY;
     this.lastX = event.pageX;
     this.lastY = event.pageY;
 
-    if (this.panning) this.pan(dx, dy);
-    if (this.rotating) this.rotate(dx, dy);
+    if (this.rotating) {
+      this.rotate(xDelta, yDelta);
+    } else if (this.panning) {
+      this.pan(xDelta, yDelta);
+    }
   }
-  upCallback(_: PointerEvent) {
+  upCallback(event: PointerEvent) {
     this.rotating = false;
     this.panning = false;
+    event.preventDefault();
   }
   wheelCallback(event: WheelEvent) {
     event.preventDefault();
     this.camera.unlock_training_camera();
-    this.zoom(event.deltaY);
-  }
-
-  private zoom(deltaY: number) {
-    // Zoom in and out for map view
-    this.camera.position[2] *= 1 + deltaY * this.zoomSpeed * 0.01;
-    this.camera.position[2] = Math.max(0.1, this.camera.position[2]);
+    const delta = vec3.mulScalar(this.camera.look, -event.deltaY * 0.001);
+    vec3.add(delta, this.camera.position, this.camera.position);
     this.camera.update_buffer();
   }
 
-  private rotate(dx: number, dy: number) {
-    // Rotate the map view
-    const yaw = -dx * this.rotateSpeed;
-    const pitch = Math.max(-0.8, Math.min(0.8, -dy * this.rotateSpeed));
-
-    const rot = mat4.identity();
-    mat4.rotateZ(rot, yaw, rot);
-    mat4.rotateX(rot, pitch, rot);
-    mat4.mul(rot, this.camera.rotation, this.camera.rotation);
+  rotate(xDelta: number, yDelta: number) {
+    const r = mat4.fromQuat(quat.fromEuler(yDelta * 0.01, -xDelta * 0.01, 0, 'xyz'));
+    mat4.mul(r, this.camera.rotation, this.camera.rotation);
     this.camera.update_buffer();
   }
 
-  private pan(dx: number, dy: number) {
-    // Pan the map view
-    dx = -dx;
-    dy = -dy;
-    const scale = this.panSpeed * this.camera.position[2];
-    const right = vec3.fromValues(1, 0, 0);
-    const forward = vec3.fromValues(0, 1, 0);
-    const move = vec3.create();
-    vec3.scale(right, dx * scale, move);
-    vec3.add(move, vec3.scale(forward, dy * scale, forward), move);
-
-    vec3.add(this.camera.position, move, this.camera.position);
+  pan(xDelta: number, yDelta: number) {
+    const d = vec3.copy(this.camera.up);
+    vec3.mulScalar(d, -yDelta * 0.01, d);
+    vec3.add(d, this.camera.position, this.camera.position);
+    vec3.copy(this.camera.right, d);
+    vec3.mulScalar(d, -xDelta * 0.01, d);
+    vec3.add(d, this.camera.position, this.camera.position);
     this.camera.update_buffer();
   }
 };
