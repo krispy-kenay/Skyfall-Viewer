@@ -24,6 +24,12 @@ struct SortInfos {
 @group(1) @binding(1) var<storage, read> sh_buffer : array<u32>;
 @group(1) @binding(2) var<storage, read_write> splats : array<Splat>;
 
+struct DebugProj {
+    pos_cam : vec4<f32>,
+    clip    : vec4<f32>,
+};
+@group(1) @binding(3) var<storage, read_write> debug_proj : array<DebugProj>;
+
 //TODO: bind your data here
 @group(2) @binding(0)
 var<storage, read_write> sort_infos: SortInfos;
@@ -129,6 +135,14 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let viewZ = -position_camera.z;
     var position_clip = camera.proj * position_camera;
     position_clip /= position_clip.w;
+
+    // Debug: record camera-space and clip-space positions for the first few gaussians
+    let max_debug = 32u;
+    if (idx < max_debug) {
+        debug_proj[idx].pos_cam = position_camera;
+        debug_proj[idx].clip = position_clip;
+    }
+
     if (abs(position_clip.x) > 1.2 || abs(position_clip.y) > 1.2 || position_camera.z < 0.0) {
         return;
     }

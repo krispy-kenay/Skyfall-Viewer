@@ -1,9 +1,8 @@
 import type { PointCloud } from './load';
 import { load as loadPly } from './load';
-import { XYZRGB } from './pointcloud-loader';
 import type { TrainingCameraData } from '../camera/camera';
 import { load_all_training_cameras_from_transforms } from '../camera/camera';
-import { loadSatelliteDataset, SatelliteDataset } from './satellite-dataset';
+import { loadColmapDatasetScene as loadColmapSceneInternal } from './colmap-dataset';
 
 export interface TrainingImageResource {
   view: GPUTextureView;
@@ -75,12 +74,18 @@ export async function loadSatelliteDatasetScene(
   dirHandle: any,
   device: GPUDevice
 ): Promise<SceneDataset> {
-  const dataset: SatelliteDataset = await loadSatelliteDataset(dirHandle, device);
-  return {
-    pointCloud: dataset.pointCloud,
-    trainingCameras: dataset.trainingCameras,
-    trainingImages: dataset.trainingImages,
-  };
+  console.warn(
+    'loadSatelliteDatasetScene is deprecated. Please use loadColmapDatasetScene with a COLMAP-style dataset folder.',
+  );
+  const dataset = await loadColmapSceneInternal(dirHandle, device);
+  return dataset;
+}
+
+export async function loadColmapDatasetScene(
+  dirHandle: any,
+  device: GPUDevice
+): Promise<SceneDataset> {
+  return await loadColmapSceneInternal(dirHandle, device);
 }
 
 

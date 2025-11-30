@@ -20,9 +20,8 @@ export interface GaussianRenderer extends Renderer {
   setGaussianScale(value: number): void;
   resizeViewport(w: number, h: number): void;
   train(numFrames: number): Promise<void>;
-  // Debug-only: run a single training step immediately (with its own command submission)
-  // and log a small slice of training buffers so we can verify gradients/updates.
   debugTrainOnce?(label?: string): Promise<void>;
+  debugDumpProjection?(label?: string): Promise<void>;
   setTargetTexture(view: GPUTextureView, sampler: GPUSampler): void;
   initializeKnn(encoder: GPUCommandEncoder): void;
   prune(): Promise<number>;
@@ -171,6 +170,9 @@ export default function get_renderer(
   let prune_bind_group: GPUBindGroup | null = null;
   let densify_bind_group: GPUBindGroup | null = null;
 
+  // Debug: projection inspection from preprocess.wgsl
+  let debug_projection_buffer: GPUBuffer | null = null;
+
   // External resources
   let targetTextureView: GPUTextureView | null = null;
   let targetSampler: GPUSampler | null = null;
@@ -211,10 +213,11 @@ export default function get_renderer(
   let tilesBuilt = false;
 
   function getCurrentTrainingCameraBuffer(): GPUBuffer {
-    // TEMP DEBUG
-    // if (training_camera_buffers.length > 0) {
-    //   return training_camera_buffers[current_training_camera_index];
-    // }
+    if (training_camera_buffers.length > 0 &&
+        current_training_camera_index >= 0 &&
+        current_training_camera_index < training_camera_buffers.length) {
+      return training_camera_buffers[current_training_camera_index];
+    }
     return camera_buffer;
   }
 
@@ -408,6 +411,13 @@ export default function get_renderer(
     gaussian_buffer_temp = createGaussianBuffer(newCapacity);
     sh_buffer_temp = createSHBuffer(newCapacity);
     density_buffer_temp = createDensityBuffer(newCapacity);
+
+    const DEBUG_PROJ_STRIDE_BYTES = 2 * 4 * FLOAT32_BYTES;
+    debug_projection_buffer = device.createBuffer({
+      label: 'debug projection (pos_cam + clip)',
+      size: newCapacity * DEBUG_PROJ_STRIDE_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
 
     // create float32 training parameter buffers
     train_position_buffer = device.createBuffer({
@@ -932,6 +942,7 @@ export default function get_renderer(
 
   function rebuildPreprocessBG() {
     if (!gaussian_buffer || !sh_buffer || !splat_buffer) return;
+    if (!debug_projection_buffer) return;
     preprocess_bg = device.createBindGroup({
       label: 'preprocess g1',
       layout: preprocess_pipeline.getBindGroupLayout(1),
@@ -939,6 +950,7 @@ export default function get_renderer(
         { binding: 0, resource: { buffer: gaussian_buffer } },
         { binding: 1, resource: { buffer: sh_buffer } },
         { binding: 2, resource: { buffer: splat_buffer } },
+        { binding: 3, resource: { buffer: debug_projection_buffer } },
       ],
     });
   }
@@ -2067,7 +2079,6 @@ export default function get_renderer(
       return;
     }
     const num_wg = Math.ceil(num / WORKGROUP_SIZE);
-    console.log('[run_training_apply_params] dispatching', num_wg, 'workgroups for', num, 'gaussians');
 
     const pass = encoder.beginComputePass({ label: 'training apply params' });
     pass.setPipeline(training_apply_params_pipeline);
@@ -2079,6 +2090,53 @@ export default function get_renderer(
   // ===============================================
   // Training
   // ===============================================
+  async function debugDumpProjection(label: string = 'proj') : Promise<void> {
+    if (!debug_projection_buffer) {
+      console.warn('[debugDumpProjection] debug_projection_buffer is null.');
+      return;
+    }
+    if (active_count === 0) {
+      console.warn('[debugDumpProjection] No active gaussians.');
+      return;
+    }
+
+    if (!sorter || !preprocess_bg) {
+      console.warn('[debugDumpProjection] sorter or preprocess_bg not ready.');
+      return;
+    }
+
+    const encoder = device.createCommandEncoder();
+    run_preprocess(encoder);
+
+    const maxDebug = Math.min(active_count, 32);
+    const DEBUG_PROJ_STRIDE_BYTES = 2 * 4 * FLOAT32_BYTES;
+    const bytes = maxDebug * DEBUG_PROJ_STRIDE_BYTES;
+    const staging = device.createBuffer({
+      label: 'debug projection staging',
+      size: bytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    encoder.copyBufferToBuffer(debug_projection_buffer, 0, staging, 0, bytes);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const copy = staging.getMappedRange().slice(0);
+    staging.unmap();
+    staging.destroy();
+
+    const floats = new Float32Array(copy);
+    const perEntry = 8;
+    const entries: Array<{ idx: number; pos_cam: number[]; clip: number[] }> = [];
+    for (let i = 0; i < maxDebug; i++) {
+      const base = i * perEntry;
+      const pos_cam = Array.from(floats.subarray(base, base + 4));
+      const clip = Array.from(floats.subarray(base + 4, base + 8));
+      entries.push({ idx: i, pos_cam, clip });
+    }
+    console.log(`[debugDumpProjection] ${label} first ${maxDebug} gaussians:`, entries);
+  }
   async function debugSampleTrainingState(label: string) {
     const sampleCount = Math.min(active_count, 8);
     if (active_count === 0) return;
@@ -2230,10 +2288,6 @@ export default function get_renderer(
     }
 
     trainingIteration++;
-    const cameraInfo = training_camera_buffers.length > 0 
-      ? ` (camera ${current_training_camera_index + 1}/${training_camera_buffers.length}${training_images.length > 0 ? `, image ${current_training_camera_index + 1}/${training_images.length}` : ''})` 
-      : '';
-    console.log(`Training iteration ${trainingIteration}${cameraInfo}...`);
 
     setActiveCount(active_count);
     zeroGradBuffers();
@@ -2373,6 +2427,7 @@ export default function get_renderer(
     setTrainingCameras,
     setTrainingImages,
     debugTrainOnce,
+    debugDumpProjection,
     buildTrainingTiles: buildTileIntersections,
   };
 }

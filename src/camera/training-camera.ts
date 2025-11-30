@@ -36,29 +36,16 @@ export function get_pinhole_projection_matrix(
   w: number,
   h: number
 ): Mat4 {
-  const fov_x = 2 * Math.atan(w / (2 * fx));
-  const fov_y = 2 * Math.atan(h / (2 * fy));
-
-  const tan_half_fov_y = Math.tan(fov_y / 2.);
-  const tan_half_fov_x = Math.tan(fov_x / 2.);
-
-  const top = tan_half_fov_y * znear;
-  const bottom = -top;
-  const right = tan_half_fov_x * znear;
-  const left = -right;
-
-  const [offsetX, offsetY] = principal_point_to_ndc(cx, cy, w, h);
-
-  const scaleX = 2.0 * znear / (right - left);
-  const scaleY = -2.0 * znear / (top - bottom);
-  const depthA = zfar / (zfar - znear);
-  const depthB = -(zfar * znear) / (zfar - znear);
+  const sx = 2.0 * fx / w;
+  const sy = -2.0 * fy / h;
+  const ox = 2.0 * cx / w - 1.0;
+  const oy = 1.0 - 2.0 * cy / h;
 
   const proj = mat4.create(
-    scaleX, 0,       0,      0,
-    0,      scaleY,  0,      0,
-    offsetX, offsetY, depthA, 1,
-    0,      0,       depthB, 0,
+    sx,  0,  ox, 0,
+    0,  sy,  oy, 0,
+    0,   0,   1, 0,
+    0,   0,   1, 0,
   );
   mat4.transpose(proj, proj);
   return proj;
@@ -167,8 +154,8 @@ export async function load_all_training_cameras_from_transforms(
   const zfar = 4_000_000;
 
   const hasRT = Array.isArray(json.R) && Array.isArray(json.T);
-  const R_fix = hasRT ? json.R : null; // Skyfall-GS training dataset is missing this???
-  const T_fix = hasRT ? json.T : null; // Skyfall-GS training dataset is missing this???
+  const R_fix = hasRT ? json.R : null;
+  const T_fix = hasRT ? json.T : null;
   const c2wKey = hasRT ? 'transform_matrix_rotated' : 'transform_matrix';
 
   const cameras: TrainingCameraData[] = [];
