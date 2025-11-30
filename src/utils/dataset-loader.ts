@@ -4,6 +4,7 @@ import { XYZRGB } from './pointcloud-loader';
 import type { TrainingCameraData } from '../camera/camera';
 import { load_all_training_cameras_from_transforms } from '../camera/camera';
 import { loadSatelliteDataset, SatelliteDataset } from './satellite-dataset';
+import { loadColmapDataset, ColmapDataset } from './colmap-dataset';
 
 export interface TrainingImageResource {
   view: GPUTextureView;
@@ -76,6 +77,18 @@ export async function loadSatelliteDatasetScene(
   device: GPUDevice
 ): Promise<SceneDataset> {
   const dataset: SatelliteDataset = await loadSatelliteDataset(dirHandle, device);
+  return {
+    pointCloud: dataset.pointCloud,
+    trainingCameras: dataset.trainingCameras,
+    trainingImages: dataset.trainingImages,
+  };
+}
+
+export async function loadColmapDatasetScene(
+  dirHandle: any,
+  device: GPUDevice
+): Promise<SceneDataset> {
+  const dataset: ColmapDataset = await loadColmapDataset(dirHandle, device);
   return {
     pointCloud: dataset.pointCloud,
     trainingCameras: dataset.trainingCameras,

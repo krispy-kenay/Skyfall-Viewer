@@ -6,7 +6,7 @@ import { default as get_renderer_pointcloud } from './point-cloud-renderer';
 import { Camera, load_camera_presets, load_satellite_camera, TrainingCameraData, load_all_training_cameras_from_transforms, CameraPreset} from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
 import { time, timeReturn } from '../utils/simple-console';
-import { loadBasicPlyDataset, loadSatelliteDatasetScene } from '../utils/dataset-loader';
+import { loadBasicPlyDataset, loadSatelliteDatasetScene, loadColmapDatasetScene } from '../utils/dataset-loader';
 import { vec3, mat4 } from 'wgpu-matrix';
 
 export interface Renderer {
@@ -148,6 +148,52 @@ export default async function init(
         if ((err as Error).name !== 'AbortError') {
           console.error('Failed to load satellite dataset:', err);
           alert(`Failed to load satellite dataset: ${(err as Error).message}`);
+        }
+      }
+    });
+  }
+  {
+    const f = pane.addFolder({ title: 'COLMAP Dataset' });
+    f.addButton({ title: 'Load COLMAP Dataset' }).on('click', async () => {
+      // @ts-ignore - File System Access API
+      if (!window.showDirectoryPicker) {
+        alert('Your browser does not support folder selection. Please use a Chromium-based browser (Chrome, Edge, etc.).');
+        return;
+      }
+
+      try {
+        // @ts-ignore
+        const dirHandle: FileSystemDirectoryHandle = await window.showDirectoryPicker();
+
+        const dataset = await loadColmapDatasetScene(dirHandle, device);
+
+        currentPointCloud = dataset.pointCloud;
+
+        pointcloud_renderer = get_renderer_pointcloud(dataset.pointCloud, device, presentation_format, camera.uniform_buffer);
+        gaussian_renderer = get_renderer_gaussian(dataset.pointCloud, device, presentation_format, camera.uniform_buffer, canvas, camera);
+        renderers = {
+          pointcloud: pointcloud_renderer,
+          gaussian: gaussian_renderer,
+        };
+        renderer = renderers[params.renderer];
+
+        training_cameras_cache = dataset.trainingCameras;
+        if (gaussian_renderer) {
+          gaussian_renderer.setTrainingCameras(dataset.trainingCameras);
+          gaussian_renderer.setTrainingImages(dataset.trainingImages);
+
+          const initEncoder = device.createCommandEncoder();
+          gaussian_renderer.initializeKnn(initEncoder);
+          device.queue.submit([initEncoder.finish()]);
+        }
+
+        ply_file_loaded = true;
+        cam_file_loaded = dataset.trainingCameras.length > 0;
+        img_file_loaded = dataset.trainingImages.length > 0;
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          console.error('Failed to load COLMAP dataset:', err);
+          alert(`Failed to load COLMAP dataset: ${(err as Error).message}`);
         }
       }
     });
