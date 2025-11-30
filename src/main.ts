@@ -19,10 +19,11 @@ import { assert } from './utils/util';
   }
   
   const device = await adapter.requestDevice({
-    requiredLimits: { 
+    requiredLimits: {
       maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
-      maxStorageBufferBindingSize: adapter.limits. maxStorageBufferBindingSize
-     },
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
+    },
   });
 
   const canvas = document.querySelector<HTMLCanvasElement>('#webgpu-canvas');

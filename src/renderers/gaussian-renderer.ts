@@ -5,9 +5,11 @@ import commonWGSL from '../shaders/common.wgsl';
 import knnInitWGSL from '../shaders/knn-init.wgsl';
 import pruneWGSL from '../shaders/prune.wgsl';
 import densifyWGSL from '../shaders/densify.wgsl';
-import trainingForwardWGSL from '../shaders/training-forward.wgsl';
+import trainingForwardTilesWGSL from '../shaders/training-forward-tiles.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
-import trainingBackwardWGSL from '../shaders/training-backward.wgsl';
+import trainingBackwardTilesWGSL from '../shaders/training-backward-tiles.wgsl';
+import trainingBackwardGeomWGSL from '../shaders/training-backward-geom.wgsl';
+import trainingTilesWGSL from '../shaders/training-tiles.wgsl';
 import trainingParamsWGSL from '../shaders/training-params.wgsl';
 import adamWGSL from '../shaders/adam.wgsl';
 import { get_sorter, C } from '../sort/sort';
@@ -17,13 +19,17 @@ import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, upda
 export interface GaussianRenderer extends Renderer {
   setGaussianScale(value: number): void;
   resizeViewport(w: number, h: number): void;
-  train(numFrames: number): void;
+  train(numFrames: number): Promise<void>;
+  // Debug-only: run a single training step immediately (with its own command submission)
+  // and log a small slice of training buffers so we can verify gradients/updates.
+  debugTrainOnce?(label?: string): Promise<void>;
   setTargetTexture(view: GPUTextureView, sampler: GPUSampler): void;
   initializeKnn(encoder: GPUCommandEncoder): void;
   prune(): Promise<number>;
   densify(): Promise<number>;
   setTrainingCameras(cameras: TrainingCameraData[]): void;
   setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>): void;
+  buildTrainingTiles(): Promise<void>;
 }
 
 // ===============================================
@@ -35,6 +41,18 @@ const BYTES_PER_SH = 96;
 const WORKGROUP_SIZE = 256;
 const PRUNE_INTERVAL = 70;
 const DENSIFY_INTERVAL = 100;
+
+// Optimization / training hyperparameters (approximate 3DGS / LichtFeld defaults)
+const OPT_ITERS = 30000;
+const SH_DEGREE_INTERVAL = 1000; // iterations between SH degree increments
+
+// TEMP: boosted learning rates to make training effects clearly visible while debugging.
+// These should be dialed back closer to LichtFeld/3DGS defaults once the pipeline is verified.
+const MEANS_LR = 1.6e-4;    // was 1.6e-5
+const SHS_LR = 2.5e-2;      // was 2.5e-3
+const OPACITY_LR = 5e-1;    // was 5e-2
+const SCALING_LR = 5e-2;    // was 5e-3
+const ROTATION_LR = 1e-2;   // was 1e-3
 
 // Float32 training parameter layout
 const FLOAT32_BYTES = 4;
@@ -77,6 +95,7 @@ export default function get_renderer(
   let capacity = 0;
   let active_count = 0;
   let pc_data: PointCloud = pc;
+  let current_sh_degree = 0;
 
   // GPU Buffers
   let splat_buffer: GPUBuffer | null = null;
@@ -99,7 +118,6 @@ export default function get_renderer(
   let training_alpha_texture: GPUTexture | null = null;
   let training_color_view: GPUTextureView | null = null;
   let training_alpha_view: GPUTextureView | null = null;
-  let training_forward_bind_group: GPUBindGroup | null = null;
   let training_width = 0;
   let training_height = 0;
 
@@ -109,9 +127,11 @@ export default function get_renderer(
   let residual_color_view: GPUTextureView | null = null;
   let residual_alpha_view: GPUTextureView | null = null;
   let training_loss_bind_group: GPUBindGroup | null = null;
-  let training_backward_bind_group: GPUBindGroup | null = null;
   let training_init_params_bind_group: GPUBindGroup | null = null;
   let training_apply_params_bind_group: GPUBindGroup | null = null;
+  let training_tiled_forward_bind_group: GPUBindGroup | null = null;
+  let training_tiled_backward_bind_group: GPUBindGroup | null = null;
+  let training_backward_geom_bind_group: GPUBindGroup | null = null;
 
   // Adam optimizer state
   let adam_config_buffer: GPUBuffer | null = null;
@@ -140,6 +160,7 @@ export default function get_renderer(
   let grad_rotation_buffer: GPUBuffer | null = null;
   let grad_opacity_buffer: GPUBuffer | null = null;
   let grad_sh_buffer: GPUBuffer | null = null;
+  let grad_alpha_splat_buffer: GPUBuffer | null = null;
 
   // Bind Groups
   let sort_bind_group: GPUBindGroup | null = null;
@@ -154,6 +175,8 @@ export default function get_renderer(
   let targetTextureView: GPUTextureView | null = null;
   let targetSampler: GPUSampler | null = null;
   let sorter: any = null;
+  let intersect_sorter: any = null;
+  let intersect_sort_capacity = 0;
 
   // Training cameras
   let training_cameras: TrainingCameraData[] = [];
@@ -162,6 +185,44 @@ export default function get_renderer(
   
   // Training images
   let training_images: Array<{ view: GPUTextureView; sampler: GPUSampler }> = [];
+
+  // Tiling buffers
+  const TILE_SIZE = 16;
+  let tiling_params_buffer: GPUBuffer | null = null;
+  let tile_means2d_buffer: GPUBuffer | null = null;
+  let tile_radii_buffer: GPUBuffer | null = null;
+  let tile_depths_buffer: GPUBuffer | null = null;
+  let tiles_per_gauss_buffer: GPUBuffer | null = null;
+  let tile_conics_buffer: GPUBuffer | null = null;
+
+  let training_tiles_project_pipeline: GPUComputePipeline | null = null;
+  let tiles_cumsum_buffer: GPUBuffer | null = null;
+  let isect_ids_buffer: GPUBuffer | null = null;
+  let flatten_ids_buffer: GPUBuffer | null = null;
+  let tile_offsets_buffer: GPUBuffer | null = null;
+  let num_intersections = 0;
+
+  // Per-pixel last gaussian index for tiled training forward
+  let training_last_ids_buffer: GPUBuffer | null = null;
+  let tile_sorter: any = null;
+  let tile_sort_capacity = 0;
+
+  // Tracking for training tiling state
+  let tilesBuilt = false;
+
+  function getCurrentTrainingCameraBuffer(): GPUBuffer {
+    // TEMP DEBUG
+    // if (training_camera_buffers.length > 0) {
+    //   return training_camera_buffers[current_training_camera_index];
+    // }
+    return camera_buffer;
+  }
+
+  // Projection parameters for training / tiling
+  let projection_params_buffer: GPUBuffer | null = null;
+  let background_params_buffer: GPUBuffer | null = null;
+  let tile_mask_buffer: GPUBuffer | null = null;
+  let loss_params_buffer: GPUBuffer | null = null;
 
   // ===============================================
   // Buffer Creation Functions
@@ -173,6 +234,54 @@ export default function get_renderer(
       32,
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       new Float32Array([1.0, pc_data.sh_deg, canvas.width, canvas.height, 1.0, 1.0])
+    );
+  }
+
+  function createProjectionParamsBuffer(): GPUBuffer {
+    const data = new Float32Array([
+      0.2,
+      10_000,
+      512.0,
+      0.3,
+    ]);
+    return createBuffer(
+      device,
+      'projection params',
+      data.byteLength,
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      data,
+    );
+  }
+
+  function createBackgroundParamsBuffer(): GPUBuffer {
+    const data = new Float32Array([
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+    ]);
+    return createBuffer(
+      device,
+      'background params',
+      data.byteLength,
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      data,
+    );
+  }
+
+  function createLossParamsBuffer(): GPUBuffer {
+    const data = new Float32Array([
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+    ]);
+    return createBuffer(
+      device,
+      'loss params',
+      data.byteLength,
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      data,
     );
   }
 
@@ -353,6 +462,44 @@ export default function get_renderer(
       size: newCapacity * TRAIN_SH_COMPONENTS * FLOAT32_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
+    grad_alpha_splat_buffer = device.createBuffer({
+      label: 'grad alpha_splat (float32)',
+      size: newCapacity * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+
+    // Tiling projection buffers
+    tile_means2d_buffer = device.createBuffer({
+      label: 'tiling means2d (float32)',
+      size: newCapacity * 2 * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    tile_radii_buffer = device.createBuffer({
+      label: 'tiling radii (float32)',
+      size: newCapacity * 2 * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    tile_depths_buffer = device.createBuffer({
+      label: 'tiling depths (float32)',
+      size: newCapacity * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    tiles_per_gauss_buffer = device.createBuffer({
+      label: 'tiling tiles_per_gauss (u32)',
+      size: newCapacity * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+
+    tile_conics_buffer = device.createBuffer({
+      label: 'tiling conics (float32)',
+      size: newCapacity * 3 * FLOAT32_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+
+    num_intersections = 0;
+    isect_ids_buffer = null;
+    flatten_ids_buffer = null;
+    tile_offsets_buffer = null;
 
     // Adam moment buffers
     moment_sh_m1_buffer = device.createBuffer({
@@ -434,6 +581,15 @@ export default function get_renderer(
   // ===============================================
   const settings_buffer = createSettingsBuffer();
   const indirect_args = createIndirectArgsBuffer();
+  projection_params_buffer = createProjectionParamsBuffer();
+  background_params_buffer = createBackgroundParamsBuffer();
+  loss_params_buffer = createLossParamsBuffer();
+
+  {
+    const initialShDegree = 0;
+    current_sh_degree = initialShDegree;
+    device.queue.writeBuffer(settings_buffer, 4, new Float32Array([initialShDegree]));
+  }
   adam_config_buffer = createBuffer(
     device,
     'adam config',
@@ -448,7 +604,7 @@ export default function get_renderer(
   function resizeViewport(w: number, h: number) {
     device.queue.writeBuffer(settings_buffer, 2 * 4, new Float32Array([w, h]));
     ensureTrainingRenderTargets(w, h);
-    rebuildTrainingForwardBG();
+    tilesBuilt = false;
   }
 
   function setActiveCount(value: number) {
@@ -459,6 +615,7 @@ export default function get_renderer(
     if (indirect_args) {
       device.queue.writeBuffer(indirect_args, 0, new Uint32Array([6, value, 0, 0]));
     }
+    tilesBuilt = false;
   }
 
   function setPruneThreshold(value: number) {
@@ -559,15 +716,6 @@ export default function get_renderer(
     primitive: { topology: 'triangle-list' },
   });
 
-  const training_forward_pipeline = device.createComputePipeline({
-    label: 'training forward',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingForwardWGSL }),
-      entryPoint: 'training_forward',
-    },
-  });
-
   const training_loss_pipeline = device.createComputePipeline({
     label: 'training loss',
     layout: 'auto',
@@ -577,17 +725,48 @@ export default function get_renderer(
     },
   });
 
-  const training_backward_pipeline = device.createComputePipeline({
-    label: 'training backward',
+  const training_backward_geom_pipeline = device.createComputePipeline({
+    label: 'training backward geom',
     layout: 'auto',
     compute: {
-      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingBackwardWGSL }),
-      entryPoint: 'training_backward',
+      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingBackwardGeomWGSL }),
+      entryPoint: 'training_backward_geom',
     },
   });
 
   const training_params_module = device.createShaderModule({
     code: commonWGSL + '\n' + trainingParamsWGSL,
+  });
+
+  const training_tiles_module = device.createShaderModule({
+    code: commonWGSL + '\n' + trainingTilesWGSL,
+  });
+
+  training_tiles_project_pipeline = device.createComputePipeline({
+    label: 'training tiles project',
+    layout: 'auto',
+    compute: {
+      module: training_tiles_module,
+      entryPoint: 'project_gaussians_for_tiling',
+    },
+  });
+
+  const training_tiles_emit_pipeline = device.createComputePipeline({
+    label: 'training tiles emit',
+    layout: 'auto',
+    compute: {
+      module: training_tiles_module,
+      entryPoint: 'emit_intersections',
+    },
+  });
+
+  const training_tiles_offsets_pipeline = device.createComputePipeline({
+    label: 'training tiles offsets',
+    layout: 'auto',
+    compute: {
+      module: training_tiles_module,
+      entryPoint: 'build_tile_offsets',
+    },
   });
 
   const training_init_params_pipeline = device.createComputePipeline({
@@ -614,6 +793,24 @@ export default function get_renderer(
     compute: {
       module: device.createShaderModule({ code: adamWGSL }),
       entryPoint: 'adam_step',
+    },
+  });
+
+  const training_tiled_forward_pipeline = device.createComputePipeline({
+    label: 'training tiled forward',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingForwardTilesWGSL }),
+      entryPoint: 'training_tiled_forward',
+    },
+  });
+
+  const training_tiled_backward_pipeline = device.createComputePipeline({
+    label: 'training tiled backward',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + trainingBackwardTilesWGSL }),
+      entryPoint: 'training_tiled_backward',
     },
   });
 
@@ -681,6 +878,16 @@ export default function get_renderer(
 
     residual_color_view = residual_color_texture.createView();
     residual_alpha_view = residual_alpha_texture.createView();
+
+    const pixelCount = width * height;
+    if (!training_last_ids_buffer || training_last_ids_buffer.size < pixelCount * 4) {
+      training_last_ids_buffer?.destroy();
+      training_last_ids_buffer = device.createBuffer({
+        label: 'training tiled last_ids (u32)',
+        size: pixelCount * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
   }
 
   function rebuildSorterBG() {
@@ -734,6 +941,114 @@ export default function get_renderer(
         { binding: 2, resource: { buffer: splat_buffer } },
       ],
     });
+  }
+
+  function ensureTilingParamsBuffer() {
+    if (!tiling_params_buffer) {
+      tiling_params_buffer = createBuffer(
+        device,
+        'tiling params',
+        6 * 4,
+        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      );
+    }
+    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
+    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const numCameras = 1;
+    const params = new Uint32Array([
+      canvas.width,
+      canvas.height,
+      TILE_SIZE,
+      tileWidth,
+      tileHeight,
+      numCameras,
+    ]);
+    device.queue.writeBuffer(tiling_params_buffer, 0, params);
+  }
+
+  function ensureTileSorter(requiredKeys: number) {
+    if (requiredKeys <= 0) {
+      tile_sorter = null;
+      tile_sort_capacity = 0;
+      return;
+    }
+    if (!tile_sorter || requiredKeys > tile_sort_capacity) {
+      tile_sorter = get_sorter(requiredKeys, device);
+      tile_sort_capacity = requiredKeys;
+    }
+  }
+
+  function ensureIntersectionBuffers(requiredIntersections: number) {
+    if (requiredIntersections <= 0) {
+      num_intersections = 0;
+      if (isect_ids_buffer) {
+        isect_ids_buffer.destroy();
+        isect_ids_buffer = null;
+      }
+      if (flatten_ids_buffer) {
+        flatten_ids_buffer.destroy();
+        flatten_ids_buffer = null;
+      }
+      if (tile_offsets_buffer) {
+        tile_offsets_buffer.destroy();
+        tile_offsets_buffer = null;
+      }
+      return;
+    }
+
+    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
+    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const tileCount = tileWidth * tileHeight;
+    const numCameras = 1;
+    const totalTiles = tileCount * numCameras;
+
+    if (!isect_ids_buffer || requiredIntersections > num_intersections) {
+      if (isect_ids_buffer) {
+        isect_ids_buffer.destroy();
+      }
+      isect_ids_buffer = device.createBuffer({
+        label: 'tiling isect_ids (u32 keys)',
+        size: requiredIntersections * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    if (!flatten_ids_buffer || requiredIntersections > num_intersections) {
+      if (flatten_ids_buffer) {
+        flatten_ids_buffer.destroy();
+      }
+      flatten_ids_buffer = device.createBuffer({
+        label: 'tiling flatten_ids (u32)',
+        size: requiredIntersections * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    if (!tile_offsets_buffer || (totalTiles + 1) * 4 > (tile_offsets_buffer?.size ?? 0)) {
+      if (tile_offsets_buffer) {
+        tile_offsets_buffer.destroy();
+      }
+      tile_offsets_buffer = device.createBuffer({
+        label: 'tiling tile_offsets (u32)',
+        size: (totalTiles + 1) * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    // Optional per-tile masks; by default all tiles are enabled (1u).
+    if (!tile_mask_buffer || totalTiles * 4 > (tile_mask_buffer?.size ?? 0)) {
+      tile_mask_buffer?.destroy();
+      tile_mask_buffer = device.createBuffer({
+        label: 'tiling tile_masks (u32)',
+        size: totalTiles * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+      const masks = new Uint32Array(totalTiles);
+      masks.fill(1);
+      device.queue.writeBuffer(tile_mask_buffer, 0, masks);
+    }
+
+    num_intersections = requiredIntersections;
   }
 
 
@@ -815,24 +1130,6 @@ export default function get_renderer(
     });
   }
 
-  function rebuildTrainingForwardBG() {
-    if (!splat_buffer || !sorter) return;
-    ensureTrainingRenderTargets(canvas.width, canvas.height);
-
-    training_forward_bind_group = device.createBindGroup({
-      label: 'training forward bind group',
-      layout: training_forward_pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: settings_buffer } },
-        { binding: 1, resource: { buffer: splat_buffer } },
-        { binding: 2, resource: { buffer: sorter.ping_pong[sorter.final_out_index].sort_indices_buffer } },
-        { binding: 3, resource: { buffer: indirect_args } },
-        { binding: 4, resource: training_color_view! },
-        { binding: 5, resource: training_alpha_view! },
-      ],
-    });
-  }
-
   function rebuildTrainingLossBG() {
     if (!training_color_view || !training_alpha_view ||
         !residual_color_view || !residual_alpha_view) {
@@ -865,6 +1162,8 @@ export default function get_renderer(
         { binding: 3, resource: training_alpha_view },
         { binding: 4, resource: residual_color_view },
         { binding: 5, resource: residual_alpha_view },
+        // LossParams: default to pure L2 (w_l2 = 1, w_l1 = 0).
+        { binding: 6, resource: { buffer: loss_params_buffer! } },
       ],
     });
   }
@@ -877,21 +1176,91 @@ export default function get_renderer(
       return;
     }
 
-    training_backward_bind_group = device.createBindGroup({
-      label: 'training backward bind group',
-      layout: training_backward_pipeline.getBindGroupLayout(0),
+    // Legacy non-tiled backward has been removed in favor of the tiled path.
+  }
+
+  function rebuildTrainingBackwardGeomBG() {
+    if (!gaussian_buffer ||
+        !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer ||
+        !grad_alpha_splat_buffer || !active_count_uniform_buffer) {
+      return;
+    }
+
+    training_backward_geom_bind_group = device.createBindGroup({
+      label: 'training backward geom bind group',
+      layout: training_backward_geom_pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: camera_buffer } },
+        { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
+        { binding: 1, resource: { buffer: gaussian_buffer } },
+        { binding: 2, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 3, resource: { buffer: grad_alpha_splat_buffer } },
+        { binding: 4, resource: { buffer: grad_position_buffer } },
+        { binding: 5, resource: { buffer: grad_scale_buffer } },
+        { binding: 6, resource: { buffer: grad_rotation_buffer } },
+      ],
+    });
+  }
+
+  function rebuildTrainingTiledForwardBG() {
+    if (!training_tiled_forward_pipeline) return;
+    if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
+    if (!tile_means2d_buffer || !tile_conics_buffer) return;
+    if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
+    if (!training_color_view || !training_alpha_view || !training_last_ids_buffer) return;
+    if (!tiles_cumsum_buffer || !active_count_uniform_buffer) return;
+
+    training_tiled_forward_bind_group = device.createBindGroup({
+      label: 'training tiled forward bind group',
+      layout: training_tiled_forward_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
         { binding: 1, resource: { buffer: settings_buffer } },
-        { binding: 2, resource: { buffer: gaussian_buffer } },
-        { binding: 3, resource: { buffer: sh_buffer } },
-        { binding: 4, resource: residual_color_view },
-        { binding: 6, resource: { buffer: grad_sh_buffer } },
-        { binding: 7, resource: { buffer: grad_opacity_buffer } },
-        { binding: 8, resource: { buffer: active_count_uniform_buffer } },
-        { binding: 9, resource: { buffer: grad_position_buffer } },
-        { binding: 10, resource: { buffer: grad_scale_buffer } },
-        { binding: 11, resource: { buffer: grad_rotation_buffer } },
+        { binding: 2, resource: { buffer: tiling_params_buffer } },
+        { binding: 3, resource: { buffer: tile_means2d_buffer } },
+        { binding: 4, resource: { buffer: tile_conics_buffer } },
+        { binding: 6, resource: { buffer: tile_offsets_buffer } },
+        { binding: 7, resource: { buffer: flatten_ids_buffer } },
+        { binding: 8, resource: training_color_view },
+        { binding: 9, resource: training_alpha_view },
+        { binding: 10, resource: { buffer: training_last_ids_buffer } },
+        { binding: 11, resource: { buffer: gaussian_buffer } },
+        { binding: 12, resource: { buffer: sh_buffer } },
+        { binding: 13, resource: { buffer: background_params_buffer! } },
+        { binding: 14, resource: { buffer: tile_mask_buffer! } },
+        { binding: 15, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 16, resource: { buffer: active_count_uniform_buffer } },
+      ],
+    });
+  }
+
+  function rebuildTrainingTiledBackwardBG() {
+    if (!training_tiled_backward_pipeline) return;
+    if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
+    if (!residual_color_view || !training_last_ids_buffer) return;
+    if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
+    if (!grad_sh_buffer || !grad_opacity_buffer || !grad_alpha_splat_buffer || !active_count_uniform_buffer) return;
+    if (!tiles_cumsum_buffer) return;
+
+    training_tiled_backward_bind_group = device.createBindGroup({
+      label: 'training tiled backward bind group',
+      layout: training_tiled_backward_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
+        { binding: 1, resource: { buffer: settings_buffer } },
+        { binding: 2, resource: { buffer: tiling_params_buffer } },
+        { binding: 3, resource: { buffer: gaussian_buffer } },
+        { binding: 4, resource: { buffer: sh_buffer } },
+        { binding: 5, resource: residual_color_view },
+        { binding: 6, resource: { buffer: training_last_ids_buffer } },
+        { binding: 7, resource: { buffer: tile_offsets_buffer } },
+        { binding: 8, resource: { buffer: flatten_ids_buffer } },
+        { binding: 9, resource: { buffer: grad_sh_buffer } },
+        { binding: 10, resource: { buffer: grad_opacity_buffer } },
+        { binding: 11, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 12, resource: { buffer: grad_alpha_splat_buffer } },
+        { binding: 13, resource: { buffer: background_params_buffer! } },
+        { binding: 14, resource: { buffer: tile_mask_buffer! } },
+        { binding: 15, resource: { buffer: tiles_cumsum_buffer } },
       ],
     });
   }
@@ -952,9 +1321,232 @@ export default function get_renderer(
     rebuildKnnInitBG();
     rebuildPruneBG();
     rebuildDensifyBG();
-    rebuildTrainingForwardBG();
+    rebuildTrainingBackwardGeomBG();
+    // Tiled training bind groups are rebuilt lazily when running tiled passes.
     rebuildTrainingInitParamsBG();
     rebuildTrainingApplyParamsBG();
+  }
+
+  function run_training_tiles_projection(encoder: GPUCommandEncoder) {
+    if (!training_tiles_project_pipeline ||
+        !gaussian_buffer ||
+        !tile_means2d_buffer || !tile_radii_buffer || !tile_depths_buffer || !tile_conics_buffer ||
+        !tiles_per_gauss_buffer ||
+        !projection_params_buffer ||
+        !active_count_uniform_buffer) {
+      return;
+    }
+
+    ensureTilingParamsBuffer();
+
+    const bindGroup = device.createBindGroup({
+      label: 'training tiles project bind group',
+      layout: training_tiles_project_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
+        { binding: 1, resource: { buffer: gaussian_buffer } },
+        { binding: 2, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 3, resource: { buffer: tiling_params_buffer! } },
+        { binding: 4, resource: { buffer: tile_means2d_buffer } },
+        { binding: 5, resource: { buffer: tile_radii_buffer } },
+        { binding: 6, resource: { buffer: tile_depths_buffer } },
+        { binding: 7, resource: { buffer: tiles_per_gauss_buffer } },
+        { binding: 12, resource: { buffer: tile_conics_buffer } },
+        { binding: 13, resource: { buffer: projection_params_buffer } },
+      ],
+    });
+
+    const num = active_count;
+    if (num === 0) return;
+    const num_wg = Math.ceil(num / WORKGROUP_SIZE);
+
+    const pass = encoder.beginComputePass({ label: 'training tiles project' });
+    pass.setPipeline(training_tiles_project_pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  async function buildTileIntersections() {
+    // Any call to this function is (re)building tiling data for the current state.
+    tilesBuilt = false;
+
+    if (!tiles_per_gauss_buffer) {
+      return;
+    }
+    if (active_count === 0) {
+      ensureIntersectionBuffers(0);
+      return;
+    }
+
+    const encoder = device.createCommandEncoder();
+    run_training_tiles_projection(encoder);
+
+    const tilesSizeBytes = active_count * 4;
+    const staging = device.createBuffer({
+      label: 'tiling tiles_per_gauss staging',
+      size: tilesSizeBytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    encoder.copyBufferToBuffer(tiles_per_gauss_buffer, 0, staging, 0, tilesSizeBytes);
+    device.queue.submit([encoder.finish()]);
+
+    await device.queue.onSubmittedWorkDone();
+    await staging.mapAsync(GPUMapMode.READ);
+    const mapped = staging.getMappedRange();
+    const countsView = new Uint32Array(mapped.slice(0, tilesSizeBytes));
+
+    const cumsum = new Uint32Array(active_count);
+    let running = 0;
+    for (let i = 0; i < active_count; i++) {
+      running += countsView[i];
+      cumsum[i] = running;
+    }
+    staging.unmap();
+    staging.destroy();
+
+    const totalIntersections = running;
+
+    if (!tiles_cumsum_buffer || tiles_cumsum_buffer.size < active_count * 4) {
+      if (tiles_cumsum_buffer) {
+        tiles_cumsum_buffer.destroy();
+      }
+      tiles_cumsum_buffer = device.createBuffer({
+        label: 'tiling tiles_cumsum (u32)',
+        size: active_count * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+      });
+    }
+    device.queue.writeBuffer(tiles_cumsum_buffer, 0, cumsum);
+
+    ensureIntersectionBuffers(totalIntersections);
+
+    if (totalIntersections === 0) {
+      return;
+    }
+
+    if (!training_tiles_emit_pipeline ||
+        !tile_means2d_buffer || !tile_radii_buffer || !tile_depths_buffer ||
+        !tiles_cumsum_buffer ||
+        !isect_ids_buffer || !flatten_ids_buffer ||
+        !active_count_uniform_buffer) {
+      return;
+    }
+
+    const emitEncoder = device.createCommandEncoder();
+    ensureTilingParamsBuffer();
+
+    const emitBindGroup = device.createBindGroup({
+      label: 'training tiles emit bind group',
+      layout: training_tiles_emit_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 2, resource: { buffer: active_count_uniform_buffer! } },
+        { binding: 3, resource: { buffer: tiling_params_buffer! } },
+        { binding: 4, resource: { buffer: tile_means2d_buffer! } },
+        { binding: 5, resource: { buffer: tile_radii_buffer! } },
+        { binding: 6, resource: { buffer: tile_depths_buffer! } },
+        { binding: 7, resource: { buffer: tiles_per_gauss_buffer! } },
+        { binding: 8, resource: { buffer: tiles_cumsum_buffer! } },
+        { binding: 9, resource: { buffer: isect_ids_buffer! } },
+        { binding: 10, resource: { buffer: flatten_ids_buffer! } },
+      ],
+    });
+
+    const num = active_count;
+    const num_wg = Math.ceil(num / WORKGROUP_SIZE);
+
+    {
+      const pass = emitEncoder.beginComputePass({ label: 'training tiles emit' });
+      pass.setPipeline(training_tiles_emit_pipeline);
+      pass.setBindGroup(0, emitBindGroup);
+      pass.dispatchWorkgroups(num_wg);
+      pass.end();
+    }
+
+    device.queue.submit([emitEncoder.finish()]);
+
+    if (totalIntersections <= 0) {
+      tilesBuilt = true;
+      return;
+    }
+
+    if (!intersect_sorter || totalIntersections > intersect_sort_capacity) {
+      intersect_sorter = get_sorter(totalIntersections, device);
+      intersect_sort_capacity = totalIntersections;
+    }
+
+    if (!intersect_sorter) {
+      return;
+    }
+
+    const sortEncoder = device.createCommandEncoder();
+    sortEncoder.copyBufferToBuffer(
+      isect_ids_buffer,
+      0,
+      intersect_sorter.ping_pong[0].sort_depths_buffer,
+      0,
+      totalIntersections * 4
+    );
+    sortEncoder.copyBufferToBuffer(
+      flatten_ids_buffer,
+      0,
+      intersect_sorter.ping_pong[0].sort_indices_buffer,
+      0,
+      totalIntersections * 4
+    );
+
+    intersect_sorter.sort(sortEncoder);
+
+    const finalPing = intersect_sorter.ping_pong[intersect_sorter.final_out_index];
+    sortEncoder.copyBufferToBuffer(
+      finalPing.sort_depths_buffer,
+      0,
+      isect_ids_buffer,
+      0,
+      totalIntersections * 4
+    );
+    sortEncoder.copyBufferToBuffer(
+      finalPing.sort_indices_buffer,
+      0,
+      flatten_ids_buffer,
+      0,
+      totalIntersections * 4
+    );
+
+    device.queue.submit([sortEncoder.finish()]);
+
+    if (!training_tiles_offsets_pipeline) {
+      return;
+    }
+
+    const offsetsEncoder = device.createCommandEncoder();
+
+    const offsetsBindGroup = device.createBindGroup({
+      label: 'training tiles offsets bind group',
+      layout: training_tiles_offsets_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 2, resource: { buffer: active_count_uniform_buffer! } },
+        { binding: 3, resource: { buffer: tiling_params_buffer! } },
+        { binding: 8, resource: { buffer: tiles_cumsum_buffer! } },
+        { binding: 9, resource: { buffer: isect_ids_buffer! } },
+        { binding: 11, resource: { buffer: tile_offsets_buffer! } },
+      ],
+    });
+
+    const nTiles = Math.ceil(canvas.width / TILE_SIZE) * Math.ceil(canvas.height / TILE_SIZE);
+    const offsets_wg = Math.ceil(Math.max(1, num_intersections, nTiles) / WORKGROUP_SIZE);
+
+    {
+      const pass = offsetsEncoder.beginComputePass({ label: 'training tiles offsets' });
+      pass.setPipeline(training_tiles_offsets_pipeline);
+      pass.setBindGroup(0, offsetsBindGroup);
+      pass.dispatchWorkgroups(offsets_wg);
+      pass.end();
+    }
+
+    device.queue.submit([offsetsEncoder.finish()]);
+
+    tilesBuilt = true;
   }
 
   // ===============================================
@@ -1080,6 +1672,7 @@ export default function get_renderer(
     }
 
     setActiveCount(safe_count);
+    tilesBuilt = false;
     resizeToActiveCount();
     camera.needsPreprocess = true;
 
@@ -1095,7 +1688,7 @@ export default function get_renderer(
   }
 
   // ===============================================
-  // Densification (Synchronous - blocks until complete)
+  // Densification
   // ===============================================
   async function densify(): Promise<number> {
     if (!densify_bind_group || !targetTextureView || active_count === 0) {
@@ -1156,6 +1749,7 @@ export default function get_renderer(
 
     const new_active_count = active_count + safe_num_new;
     setActiveCount(new_active_count);
+    tilesBuilt = false;
     camera.needsPreprocess = true;
 
     if (new_active_count > 0) {
@@ -1206,21 +1800,34 @@ export default function get_renderer(
     encoder.copyBufferToBuffer(sorter.sort_info_buffer, 0, indirect_args, 4, 4);
   }
 
-  function run_training_forward(encoder: GPUCommandEncoder) {
-    if (!training_forward_bind_group || !splat_buffer || !sorter) return;
-
-    // Ensure render targets match current viewport
+  function run_training_tiled_forward(encoder: GPUCommandEncoder) {
     ensureTrainingRenderTargets(canvas.width, canvas.height);
-    rebuildTrainingForwardBG();
+    ensureTilingParamsBuffer();
+
+    if (!training_tiles_project_pipeline) {
+      console.warn('training_tiles_project_pipeline is null, cannot run tiled training forward');
+      return;
+    }
+    if (!tile_means2d_buffer || !tile_conics_buffer || !tile_depths_buffer ||
+        !tile_offsets_buffer || !flatten_ids_buffer) {
+      console.warn('Tiling buffers are not ready, call buildTrainingTiles() before tiled training');
+      return;
+    }
+
+    rebuildTrainingTiledForwardBG();
+    if (!training_tiled_forward_bind_group) {
+      console.warn('training_tiled_forward_bind_group is null, skipping tiled training_forward dispatch');
+      return;
+    }
 
     const wgSizeX = 8;
     const wgSizeY = 8;
     const numGroupsX = Math.ceil(canvas.width / wgSizeX);
     const numGroupsY = Math.ceil(canvas.height / wgSizeY);
 
-    const pass = encoder.beginComputePass({ label: 'training forward' });
-    pass.setPipeline(training_forward_pipeline);
-    pass.setBindGroup(0, training_forward_bind_group);
+    const pass = encoder.beginComputePass({ label: 'training tiled forward' });
+    pass.setPipeline(training_tiled_forward_pipeline);
+    pass.setBindGroup(0, training_tiled_forward_bind_group);
     pass.dispatchWorkgroups(numGroupsX, numGroupsY);
     pass.end();
   }
@@ -1245,24 +1852,57 @@ export default function get_renderer(
     pass.end();
   }
 
-  function run_training_backward(encoder: GPUCommandEncoder) {
+  function run_training_tiled_backward(encoder: GPUCommandEncoder) {
     ensureTrainingRenderTargets(canvas.width, canvas.height);
-    rebuildTrainingBackwardBG();
+    ensureTilingParamsBuffer();
 
     const num = active_count;
-    if (!training_backward_bind_group) {
-      console.warn('training_backward_bind_group is null, skipping training_backward dispatch');
-      return;
-    }
     if (num === 0) {
-      console.warn('No active gaussians, skipping training_backward dispatch');
+      console.warn('No active gaussians, skipping tiled training_backward dispatch');
       return;
     }
+
+    if (!tile_offsets_buffer || !flatten_ids_buffer) {
+      console.warn('Tiling intersection buffers are not ready, call buildTrainingTiles() before tiled backward');
+      return;
+    }
+
+    rebuildTrainingTiledBackwardBG();
+    if (!training_tiled_backward_bind_group) {
+      console.warn('training_tiled_backward_bind_group is null, skipping tiled training_backward dispatch');
+      return;
+    }
+
+    const wgSizeX = 8;
+    const wgSizeY = 8;
+    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
+    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+
+    const pass = encoder.beginComputePass({ label: 'training tiled backward' });
+    pass.setPipeline(training_tiled_backward_pipeline);
+    pass.setBindGroup(0, training_tiled_backward_bind_group);
+    pass.dispatchWorkgroups(numGroupsX, numGroupsY);
+    pass.end();
+  }
+
+  function run_training_backward_geom(encoder: GPUCommandEncoder) {
+    const num = active_count;
+    if (num === 0) {
+      console.warn('No active gaussians, skipping training_backward_geom dispatch');
+      return;
+    }
+
+    rebuildTrainingBackwardGeomBG();
+    if (!training_backward_geom_bind_group) {
+      console.warn('training_backward_geom_bind_group is null, skipping training_backward_geom dispatch');
+      return;
+    }
+
     const num_wg = Math.ceil(num / WORKGROUP_SIZE);
 
-    const pass = encoder.beginComputePass({ label: 'training backward' });
-    pass.setPipeline(training_backward_pipeline);
-    pass.setBindGroup(0, training_backward_bind_group);
+    const pass = encoder.beginComputePass({ label: 'training backward geom' });
+    pass.setPipeline(training_backward_geom_pipeline);
+    pass.setBindGroup(0, training_backward_geom_bind_group);
     pass.dispatchWorkgroups(num_wg);
     pass.end();
   }
@@ -1334,11 +1974,11 @@ export default function get_renderer(
     const scale_elements = active_count * TRAIN_SCALE_COMPONENTS;
     const rot_elements = active_count * TRAIN_ROT_COMPONENTS;
 
-    const lr_means = 1.6e-5;
-    const lr_sh = 2.5e-3;
-    const lr_opacity = 5e-2;
-    const lr_scale = 5e-3;
-    const lr_rotation = 1e-3;
+    const lr_means = MEANS_LR;
+    const lr_sh = SHS_LR;
+    const lr_opacity = OPACITY_LR;
+    const lr_scale = SCALING_LR;
+    const lr_rotation = ROTATION_LR;
 
     if (sh_elements > 0) {
       run_adam_on_buffer(
@@ -1439,6 +2079,109 @@ export default function get_renderer(
   // ===============================================
   // Training
   // ===============================================
+  async function debugSampleTrainingState(label: string) {
+    const sampleCount = Math.min(active_count, 8);
+    if (active_count === 0) return;
+
+    if (!train_opacity_buffer || !grad_opacity_buffer || !grad_alpha_splat_buffer) {
+      return;
+    }
+
+    const sampleBytes = sampleCount * FLOAT32_BYTES;
+    const fullBytes = active_count * FLOAT32_BYTES;
+    const encoder = device.createCommandEncoder();
+
+    const makeStaging = (dbgLabel: string, size: number) =>
+      device.createBuffer({
+        label: dbgLabel,
+        size,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+
+    const stTrainOpacity = makeStaging('debug train_opacity', sampleBytes);
+    const stGradOpacity = makeStaging('debug grad_opacity_full', fullBytes);
+    const stGradAlphaSplat = makeStaging('debug grad_alpha_splat_full', fullBytes);
+
+    encoder.copyBufferToBuffer(train_opacity_buffer, 0, stTrainOpacity, 0, sampleBytes);
+    encoder.copyBufferToBuffer(grad_opacity_buffer, 0, stGradOpacity, 0, fullBytes);
+    encoder.copyBufferToBuffer(grad_alpha_splat_buffer, 0, stGradAlphaSplat, 0, fullBytes);
+
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    try {
+      // Map and log train_opacity slice
+      await stTrainOpacity.mapAsync(GPUMapMode.READ);
+      {
+        const copy = stTrainOpacity.getMappedRange().slice(0);
+        const arr = Array.from(new Float32Array(copy));
+        console.log(`[training debug] ${label} train_opacity[0:${sampleCount}] =`, arr);
+      }
+      stTrainOpacity.unmap();
+
+      // Map and analyze full grad_opacity
+      await stGradOpacity.mapAsync(GPUMapMode.READ);
+      const gradOpArrFull = new Float32Array(stGradOpacity.getMappedRange().slice(0));
+      stGradOpacity.unmap();
+
+      let nonZeroOp = 0;
+      let maxAbsOp = 0;
+      const examplesOp: Array<{ idx: number; v: number }> = [];
+      for (let i = 0; i < active_count; i++) {
+        const v = gradOpArrFull[i];
+        if (v !== 0) {
+          nonZeroOp++;
+          const av = Math.abs(v);
+          if (av > maxAbsOp) maxAbsOp = av;
+          if (examplesOp.length < 5) {
+            examplesOp.push({ idx: i, v });
+          }
+        }
+      }
+      console.log(
+        `[training debug] ${label} grad_opacity stats: nonZero=${nonZeroOp}/${active_count}, maxAbs=${maxAbsOp}, examples=`,
+        examplesOp,
+      );
+      console.log(
+        `[training debug] ${label} grad_opacity[0:${sampleCount}] =`,
+        Array.from(gradOpArrFull.subarray(0, sampleCount)),
+      );
+
+      // Map and analyze full grad_alpha_splat
+      await stGradAlphaSplat.mapAsync(GPUMapMode.READ);
+      const gradAlphaArrFull = new Float32Array(stGradAlphaSplat.getMappedRange().slice(0));
+      stGradAlphaSplat.unmap();
+
+      let nonZeroAlpha = 0;
+      let maxAbsAlpha = 0;
+      const examplesAlpha: Array<{ idx: number; v: number }> = [];
+      for (let i = 0; i < active_count; i++) {
+        const v = gradAlphaArrFull[i];
+        if (v !== 0) {
+          nonZeroAlpha++;
+          const av = Math.abs(v);
+          if (av > maxAbsAlpha) maxAbsAlpha = av;
+          if (examplesAlpha.length < 5) {
+            examplesAlpha.push({ idx: i, v });
+          }
+        }
+      }
+      console.log(
+        `[training debug] ${label} grad_alpha_splat stats: nonZero=${nonZeroAlpha}/${active_count}, maxAbs=${maxAbsAlpha}, examples=`,
+        examplesAlpha,
+      );
+      await Promise.all([
+        Promise.resolve(),
+        Promise.resolve(),
+        Promise.resolve(),
+      ]);
+    } finally {
+      stTrainOpacity.destroy();
+      stGradOpacity.destroy();
+      stGradAlphaSplat.destroy();
+    }
+  }
+
   function zeroGradBuffers() {
     if (!grad_sh_buffer || !grad_opacity_buffer ||
         !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer) return;
@@ -1447,6 +2190,7 @@ export default function get_renderer(
     const pos_elements = capacity * TRAIN_POS_COMPONENTS;
     const scale_elements = capacity * TRAIN_SCALE_COMPONENTS;
     const rot_elements = capacity * TRAIN_ROT_COMPONENTS;
+    const alpha_splat_elements = capacity;
     if (sh_elements > 0) {
       device.queue.writeBuffer(grad_sh_buffer, 0, new Float32Array(sh_elements));
     }
@@ -1462,10 +2206,25 @@ export default function get_renderer(
     if (rot_elements > 0) {
       device.queue.writeBuffer(grad_rotation_buffer, 0, new Float32Array(rot_elements));
     }
+    if (alpha_splat_elements > 0 && grad_alpha_splat_buffer) {
+      device.queue.writeBuffer(grad_alpha_splat_buffer, 0, new Float32Array(alpha_splat_elements));
+    }
+  }
+
+  function updateShDegreeSchedule() {
+    const maxDeg = pc_data.sh_deg;
+    if (maxDeg <= 0) return;
+
+    const scheduledDeg = Math.min(maxDeg, Math.floor(trainingIteration / SH_DEGREE_INTERVAL));
+    if (scheduledDeg === current_sh_degree) return;
+
+    current_sh_degree = scheduledDeg;
+    const shDegArray = new Float32Array([current_sh_degree]);
+    device.queue.writeBuffer(settings_buffer, 4, shDegArray);
+    console.log('[SH schedule] degree ->', current_sh_degree);
   }
 
   function trainStep(encoder: GPUCommandEncoder) {
-    // Choose current training camera index for logging / loss target selection
     if (training_camera_buffers.length > 0) {
       current_training_camera_index = trainingIteration % training_camera_buffers.length;
     }
@@ -1479,10 +2238,13 @@ export default function get_renderer(
     setActiveCount(active_count);
     zeroGradBuffers();
 
-    // Forward -> Loss -> Backward -> Adam
-    run_training_forward(encoder);
+    updateShDegreeSchedule();
+
+    // Forward -> Loss -> Backward -> Adam (tiled path is now canonical)
+    run_training_tiled_forward(encoder);
     run_training_loss(encoder);
-    run_training_backward(encoder);
+    run_training_tiled_backward(encoder);
+    run_training_backward_geom(encoder);
     run_adam_updates(encoder);
     rebuildTrainingApplyParamsBG();
     run_training_apply_params(encoder);
@@ -1490,8 +2252,48 @@ export default function get_renderer(
     camera.needsPreprocess = true;
   }
 
-  function train(numFrames: number) {
+  async function train(numFrames: number): Promise<void> {
+    if (!tilesBuilt) {
+      console.log('[train] Building training tiles before scheduling training...');
+      try {
+        await buildTileIntersections();
+      } catch (err) {
+        console.error('Error while building training tiles:', err);
+        return;
+      }
+      if (!tilesBuilt) {
+        console.warn('Training tiles build did not complete successfully; skipping training request.');
+        return;
+      }
+    }
     trainingCount += numFrames;
+  }
+
+  async function debugTrainOnce(label: string = 'debugTrainOnce') : Promise<void> {
+    if (active_count === 0) {
+      console.warn('[debugTrainOnce] No active gaussians.');
+      return;
+    }
+    if (!tilesBuilt) {
+      console.log('[debugTrainOnce] Building training tiles before debug step...');
+      try {
+        await buildTileIntersections();
+      } catch (err) {
+        console.error('[debugTrainOnce] Error while building tiles:', err);
+        return;
+      }
+      if (!tilesBuilt) {
+        console.warn('[debugTrainOnce] Tiles failed to build; aborting debug step.');
+        return;
+      }
+    }
+
+    const encoder = device.createCommandEncoder();
+    trainStep(encoder);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await debugSampleTrainingState(label + ` (iter ${trainingIteration})`);
   }
 
   // ===============================================
@@ -1570,5 +2372,7 @@ export default function get_renderer(
     densify,
     setTrainingCameras,
     setTrainingImages,
+    debugTrainOnce,
+    buildTrainingTiles: buildTileIntersections,
   };
 }
