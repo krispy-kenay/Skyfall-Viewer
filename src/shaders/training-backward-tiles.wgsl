@@ -30,7 +30,7 @@ struct BackgroundParams {
 
 @group(0) @binding(11) var<uniform> active_count : u32;
 
-@group(0) @binding(12) var<storage, read_write> grad_alpha_splat : array<f32>;
+@group(0) @binding(12) var<storage, read_write> grad_alpha_splat : array<atomic<i32>>;
 
 @group(0) @binding(13) var<uniform> background : BackgroundParams;
 @group(0) @binding(14) var<storage, read> tile_masks : array<u32>;
@@ -39,6 +39,30 @@ struct BackgroundParams {
 
 const MAX_SH_COEFFS_TB : u32 = 16u;
 const SH_COMPONENTS_TB : u32 = MAX_SH_COEFFS_TB * 3u;
+
+const MIN_ALPHA_THRESHOLD_RCP_TB : f32 = 255.0;
+const MIN_ALPHA_THRESHOLD_TB     : f32 = 1.0 / MIN_ALPHA_THRESHOLD_RCP_TB;
+const MAX_FRAGMENT_ALPHA_TB      : f32 = 0.999;
+const TRANSMITTANCE_THRESHOLD_TB : f32 = 1e-4;
+
+const GRAD_ALPHA_SCALE_TB : f32 = 1e3;
+
+fn alphaGradToFixed(v: f32) -> i32 {
+    return i32(round(v * GRAD_ALPHA_SCALE_TB));
+}
+
+fn alphaGradToFloat(v: i32) -> f32 {
+    return f32(v) / GRAD_ALPHA_SCALE_TB;
+}
+
+fn quat_to_mat3_tiling_bw(q: vec4<f32>) -> mat3x3<f32> {
+    let rx = q[0]; let ry = q[1]; let rz = q[2]; let rw = q[3];
+    return mat3x3<f32>(
+        1.0 - 2.0*(ry * ry + rz * rz),  2.0*(rx * ry - rw * rz),        2.0*(rx * rz + rw * ry),
+        2.0*(rx * ry + rw * rz),        1.0 - 2.0*(rx * rx + rz * rz),  2.0*(ry * rz - rw * rx),
+        2.0*(rx * rz - rw * ry),        2.0*(ry * rz + rw * rx),        1.0 - 2.0*(rx * rx + ry * ry)
+    );
+}
 
 fn read_f16_coeff_tb(base_word: u32, elem: u32) -> f32 {
     let word_idx = base_word + (elem >> 1u);
@@ -286,16 +310,90 @@ fn training_tiled_backward(@builtin(global_invocation_id) gid : vec3<u32>) {
         let gg = gaussians[g_idx];
         let p01 = unpack2x16float(gg.pos_opacity[0u]);
         let p02 = unpack2x16float(gg.pos_opacity[1u]);
+        let r01 = unpack2x16float(gg.rot[0u]);
+        let r02 = unpack2x16float(gg.rot[1u]);
+        let s01 = unpack2x16float(gg.scale[0u]);
+        let s02 = unpack2x16float(gg.scale[1u]);
 
         let position_world = vec4<f32>(p01.x, p01.y, p02.x, 1.0);
+        let position_camera = camera.view * position_world;
+        var position_clip = camera.proj * position_camera;
+        position_clip /= position_clip.w;
+
+        let log_sigma = vec3<f32>(
+            clamp(s01.x, -10.0, 10.0),
+            clamp(s01.y, -10.0, 10.0),
+            clamp(s02.x, -10.0, 10.0)
+        );
+        let sigma = exp(log_sigma);
+
+        let S = mat3x3<f32>(
+            sigma.x, 0.0,    0.0,
+            0.0,    sigma.y, 0.0,
+            0.0,    0.0,    sigma.z
+        );
+
+        let q = normalize(vec4<f32>(r01.y, r02.x, r02.y, r01.x));
+        let R = quat_to_mat3_tiling_bw(q);
+
+        let C3D = transpose(S * R) * S * R;
+
+        let t_cam = position_camera.xyz;
+        let fx = camera.focal.x;
+        let fy = camera.focal.y;
+        let J = mat3x3<f32>(
+            fx / t_cam.z, 0.0, - (fx * t_cam.x) / (t_cam.z * t_cam.z),
+            0.0, fy / t_cam.z, - (fy * t_cam.y) / (t_cam.z * t_cam.z),
+            0.0, 0.0, 0.0
+        );
+
+        let Rwc = mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
+        let T = J * Rwc;
+
+        var C2D = T * C3D * transpose(T);
+
+        C2D[0][0] += 0.3;
+        C2D[1][1] += 0.3;
+
+        let det = C2D[0][0] * C2D[1][1] - C2D[0][1] * C2D[0][1];
+        if (det <= 0.0) {
+            continue;
+        }
+
+        let det_inv = 1.0 / det;
+        let aa = C2D[1][1] * det_inv;
+        let bb = -C2D[0][1] * det_inv;
+        let cc = C2D[0][0] * det_inv;
+
+        let dims = vec2<f32>(f32(tiling.image_width), f32(tiling.image_height));
+        let ndc = position_clip.xy;
+        let center_px = 0.5 * (ndc + vec2<f32>(1.0, 1.0)) * dims;
+
+        let pixel = vec2<f32>(px, py);
+        let d = pixel - center_px;
+
+        let sigma_over_2 = 0.5 * (aa * d.x * d.x + cc * d.y * d.y) + bb * d.x * d.y;
+        if (sigma_over_2 < 0.0) {
+            continue;
+        }
+
+        let gaussian = exp(-sigma_over_2);
+
         let viewDir = normalize(-(camera.view * position_world).xyz);
         let sh_deg = u32(settings.sh_deg);
 
         let base_opacity_logit = p02.y;
         let opacity = 1.0 / (1.0 + exp(-base_opacity_logit));
 
+        let alpha_local = opacity * gaussian;
+        let alpha_splat = min(alpha_local, MAX_FRAGMENT_ALPHA_TB);
+        if (alpha_splat < MIN_ALPHA_THRESHOLD_TB) {
+            continue;
+        }
+
         let one_minus_alpha = 1.0 - alpha_acc;
-        let contrib_alpha = opacity * one_minus_alpha;
+
+        let contrib_alpha = alpha_splat * one_minus_alpha;
 
         let res_scaled = res * contrib_alpha;
         accumulate_sh_grads_tb(g_idx, viewDir, res_scaled, sh_deg);
@@ -305,12 +403,13 @@ fn training_tiled_backward(@builtin(global_invocation_id) gid : vec3<u32>) {
         let bg_term = dot(res, background.color);
         let dL_dalpha_splat = (fg_term - bg_term) * one_minus_alpha;
 
-        grad_opacity[g_idx] += dL_dalpha_splat;
+        let dL_dlogit = dL_dalpha_splat * alpha_splat * (1.0 - opacity);
+        grad_opacity[g_idx] += dL_dlogit;
 
-        grad_alpha_splat[g_idx] += dL_dalpha_splat;
+        atomicAdd(&grad_alpha_splat[g_idx], alphaGradToFixed(dL_dalpha_splat * gaussian));
 
         alpha_acc += contrib_alpha;
-        if (1.0 - alpha_acc < 1e-4) {
+        if (1.0 - alpha_acc < TRANSMITTANCE_THRESHOLD_TB) {
             break;
         }
     }

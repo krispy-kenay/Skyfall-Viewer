@@ -136,9 +136,9 @@ export default async function init(
           gaussian_renderer.setTrainingCameras(dataset.trainingCameras);
           gaussian_renderer.setTrainingImages(dataset.trainingImages);
 
-          const initEncoder = device.createCommandEncoder();
-          gaussian_renderer.initializeKnn(initEncoder);
-          device.queue.submit([initEncoder.finish()]);
+          //const initEncoder = device.createCommandEncoder();
+          //gaussian_renderer.initializeKnn(initEncoder);
+          //device.queue.submit([initEncoder.finish()]);
         }
 
         dataset_loaded = true;

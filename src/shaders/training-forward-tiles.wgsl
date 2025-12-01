@@ -37,6 +37,11 @@ struct BackgroundParams {
 const MAX_SH_COEFFS_TF : u32 = 16u;
 const SH_COMPONENTS_TF : u32 = MAX_SH_COEFFS_TF * 3u;
 
+const MIN_ALPHA_THRESHOLD_RCP : f32 = 255.0;
+const MIN_ALPHA_THRESHOLD     : f32 = 1.0 / MIN_ALPHA_THRESHOLD_RCP;
+const MAX_FRAGMENT_ALPHA      : f32 = 0.999;
+const TRANSMITTANCE_THRESHOLD : f32 = 1e-4;
+
 fn read_f16_coeff_tf(base_word: u32, elem: u32) -> f32 {
     let word_idx = base_word + (elem >> 1u);
     let halves   = unpack2x16float(sh_buffer[word_idx]);
@@ -172,8 +177,8 @@ fn training_tiled_forward(@builtin(global_invocation_id) gid : vec3<u32>) {
         let c = conics[g_idx].z;
 
         let d = pixel - center_px;
-        let t = a * d.x * d.x + 2.0 * b * d.x * d.y + c * d.y * d.y;
-        if (t > 9.0) {
+        let sigma_over_2 = 0.5 * (a * d.x * d.x + c * d.y * d.y) + b * d.x * d.y;
+        if (sigma_over_2 < 0.0) {
             continue;
         }
 
@@ -190,8 +195,10 @@ fn training_tiled_forward(@builtin(global_invocation_id) gid : vec3<u32>) {
 
         let vis_color = computeColorFromSH_tf(viewDir, g_idx, sh_deg);
 
-        let alpha_splat = clamp(opacity * exp(-0.5 * t), 0.0, 1.0);
-        if (alpha_splat <= 0.0) {
+        let gaussian = exp(-sigma_over_2);
+        let alpha_local = opacity * gaussian;
+        let alpha_splat = min(alpha_local, MAX_FRAGMENT_ALPHA);
+        if (alpha_splat < MIN_ALPHA_THRESHOLD) {
             continue;
         }
 
@@ -200,7 +207,7 @@ fn training_tiled_forward(@builtin(global_invocation_id) gid : vec3<u32>) {
         color += vis_color * contrib_alpha;
         alpha += contrib_alpha;
 
-        if (1.0 - alpha < 1e-4) {
+        if (1.0 - alpha < TRANSMITTANCE_THRESHOLD) {
             break;
         }
     }

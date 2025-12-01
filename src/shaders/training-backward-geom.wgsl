@@ -3,7 +3,7 @@
 @group(0) @binding(1) var<storage, read> gaussians : array<Gaussian>;
 @group(0) @binding(2) var<uniform> active_count : u32;
 
-@group(0) @binding(3) var<storage, read> grad_alpha_splat : array<f32>;
+@group(0) @binding(3) var<storage, read_write> grad_alpha_splat : array<atomic<i32>>;
 
 @group(0) @binding(4) var<storage, read_write> grad_position : array<f32>;
 @group(0) @binding(5) var<storage, read_write> grad_scale : array<f32>;
@@ -12,6 +12,12 @@
 const TRAIN_POS_COMPONENTS : u32 = 3u;
 const TRAIN_SCALE_COMPONENTS : u32 = 3u;
 const TRAIN_ROT_COMPONENTS : u32 = 4u;
+
+const GRAD_ALPHA_SCALE_GEOM : f32 = 1e3;
+
+fn alphaGradToFloatGeom(v: i32) -> f32 {
+    return f32(v) / GRAD_ALPHA_SCALE_GEOM;
+}
 
 fn safe_normalize(v: vec3<f32>) -> vec3<f32> {
     let l = dot(v, v);
@@ -197,7 +203,7 @@ fn training_backward_geom(@builtin(global_invocation_id) gid : vec3<u32>) {
     let alpha_geom = opacity * vis;
 
     if (power <= 0.0 && alpha_geom > (1.0 / 255.0)) {
-        let v_alpha = grad_alpha_splat[idx];
+        let v_alpha = alphaGradToFloatGeom(atomicLoad(&grad_alpha_splat[idx]));
         let v_vis = opacity * v_alpha;
         let v_gradDist = -0.5 * vis * v_vis;
 

@@ -41,17 +41,16 @@ const WORKGROUP_SIZE = 256;
 const PRUNE_INTERVAL = 70;
 const DENSIFY_INTERVAL = 100;
 
-// Optimization / training hyperparameters (approximate 3DGS / LichtFeld defaults)
+// Optimization / training hyperparameters 
 const OPT_ITERS = 30000;
-const SH_DEGREE_INTERVAL = 1000; // iterations between SH degree increments
+const SH_DEGREE_INTERVAL = 1000;
 
-// TEMP: boosted learning rates to make training effects clearly visible while debugging.
-// These should be dialed back closer to LichtFeld/3DGS defaults once the pipeline is verified.
-const MEANS_LR = 1.6e-4;    // was 1.6e-5
-const SHS_LR = 2.5e-2;      // was 2.5e-3
-const OPACITY_LR = 5e-1;    // was 5e-2
-const SCALING_LR = 5e-2;    // was 5e-3
-const ROTATION_LR = 1e-2;   // was 1e-3
+// Learning rates
+const MEANS_LR = 5e-4;
+const SHS_LR = 5e-1;
+const OPACITY_LR = 5e-1;
+const SCALING_LR = 5e-1;
+const ROTATION_LR = 5e-1;
 
 // Float32 training parameter layout
 const FLOAT32_BYTES = 4;
@@ -1434,6 +1433,7 @@ export default function get_renderer(
     ensureIntersectionBuffers(totalIntersections);
 
     if (totalIntersections === 0) {
+      tilesBuilt = true;
       return;
     }
 
@@ -2146,7 +2146,11 @@ export default function get_renderer(
     }
 
     const sampleBytes = sampleCount * FLOAT32_BYTES;
-    const fullBytes = active_count * FLOAT32_BYTES;
+    const fullScalarBytes = active_count * FLOAT32_BYTES;
+
+    const scaleElements = active_count * TRAIN_SCALE_COMPONENTS;
+    const scaleBytes = scaleElements * FLOAT32_BYTES;
+
     const encoder = device.createCommandEncoder();
 
     const makeStaging = (dbgLabel: string, size: number) =>
@@ -2157,12 +2161,22 @@ export default function get_renderer(
       });
 
     const stTrainOpacity = makeStaging('debug train_opacity', sampleBytes);
-    const stGradOpacity = makeStaging('debug grad_opacity_full', fullBytes);
-    const stGradAlphaSplat = makeStaging('debug grad_alpha_splat_full', fullBytes);
+    const stGradOpacity = makeStaging('debug grad_opacity_full', fullScalarBytes);
+    const stGradAlphaSplat = makeStaging('debug grad_alpha_splat_full', fullScalarBytes);
 
     encoder.copyBufferToBuffer(train_opacity_buffer, 0, stTrainOpacity, 0, sampleBytes);
-    encoder.copyBufferToBuffer(grad_opacity_buffer, 0, stGradOpacity, 0, fullBytes);
-    encoder.copyBufferToBuffer(grad_alpha_splat_buffer, 0, stGradAlphaSplat, 0, fullBytes);
+    encoder.copyBufferToBuffer(grad_opacity_buffer, 0, stGradOpacity, 0, fullScalarBytes);
+    encoder.copyBufferToBuffer(grad_alpha_splat_buffer, 0, stGradAlphaSplat, 0, fullScalarBytes);
+
+    let stTrainScale: GPUBuffer | null = null;
+    let stGradScale: GPUBuffer | null = null;
+    const haveScaleBuffers = !!train_scale_buffer && !!grad_scale_buffer && scaleElements > 0;
+    if (haveScaleBuffers) {
+      stTrainScale = makeStaging('debug train_scale_full', scaleBytes);
+      stGradScale = makeStaging('debug grad_scale_full', scaleBytes);
+      encoder.copyBufferToBuffer(train_scale_buffer!, 0, stTrainScale, 0, scaleBytes);
+      encoder.copyBufferToBuffer(grad_scale_buffer!, 0, stGradScale, 0, scaleBytes);
+    }
 
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
@@ -2228,16 +2242,166 @@ export default function get_renderer(
         `[training debug] ${label} grad_alpha_splat stats: nonZero=${nonZeroAlpha}/${active_count}, maxAbs=${maxAbsAlpha}, examples=`,
         examplesAlpha,
       );
-      await Promise.all([
-        Promise.resolve(),
-        Promise.resolve(),
-        Promise.resolve(),
-      ]);
+
+      if (haveScaleBuffers && stTrainScale && stGradScale) {
+        await stTrainScale.mapAsync(GPUMapMode.READ);
+        const scaleArr = new Float32Array(stTrainScale.getMappedRange().slice(0));
+        stTrainScale.unmap();
+
+        await stGradScale.mapAsync(GPUMapMode.READ);
+        const gradScaleArr = new Float32Array(stGradScale.getMappedRange().slice(0));
+        stGradScale.unmap();
+
+        const totalScaleEntries = active_count * TRAIN_SCALE_COMPONENTS;
+        let minLog = Number.POSITIVE_INFINITY;
+        let maxLog = Number.NEGATIVE_INFINITY;
+        let sumLog = 0;
+
+        let minSigma = Number.POSITIVE_INFINITY;
+        let maxSigma = Number.NEGATIVE_INFINITY;
+        let sumSigma = 0;
+
+        let maxAbsGradScale = 0;
+
+        for (let i = 0; i < active_count; i++) {
+          const base = i * TRAIN_SCALE_COMPONENTS;
+          for (let c = 0; c < TRAIN_SCALE_COMPONENTS; c++) {
+            const logv = scaleArr[base + c];
+            if (Number.isFinite(logv)) {
+              if (logv < minLog) minLog = logv;
+              if (logv > maxLog) maxLog = logv;
+              sumLog += logv;
+
+              const sigma = Math.exp(logv);
+              if (sigma < minSigma) minSigma = sigma;
+              if (sigma > maxSigma) maxSigma = sigma;
+              sumSigma += sigma;
+            }
+
+            const gv = gradScaleArr[base + c];
+            const ag = Math.abs(gv);
+            if (ag > maxAbsGradScale) maxAbsGradScale = ag;
+          }
+        }
+
+        const meanLog = totalScaleEntries > 0 ? sumLog / totalScaleEntries : 0;
+        const meanSigma = totalScaleEntries > 0 ? sumSigma / totalScaleEntries : 0;
+
+        console.log(
+          `[training debug] ${label} train_scale (log_sigma) stats: min=${minLog}, max=${maxLog}, mean=${meanLog}`,
+        );
+        console.log(
+          `[training debug] ${label} train_scale (sigma) stats: min=${minSigma}, max=${maxSigma}, mean=${meanSigma}`,
+        );
+        console.log(
+          `[training debug] ${label} grad_scale stats: maxAbs=${maxAbsGradScale}`,
+        );
+
+        const scaleSamples: Array<{ idx: number; log_sigma: number[]; sigma: number[] }> = [];
+        const gradScaleSamples: Array<{ idx: number; grad: number[] }> = [];
+        const sampleGauss = Math.min(sampleCount, active_count);
+        for (let i = 0; i < sampleGauss; i++) {
+          const base = i * TRAIN_SCALE_COMPONENTS;
+          const ls = [
+            scaleArr[base + 0],
+            scaleArr[base + 1],
+            scaleArr[base + 2],
+          ];
+          const sig = ls.map((v) => Math.exp(v));
+          scaleSamples.push({ idx: i, log_sigma: ls, sigma: sig });
+
+          const gs = [
+            gradScaleArr[base + 0],
+            gradScaleArr[base + 1],
+            gradScaleArr[base + 2],
+          ];
+          gradScaleSamples.push({ idx: i, grad: gs });
+        }
+        console.log(
+          `[training debug] ${label} train_scale[0:${sampleGauss}] (per-gaussian log_sigma, sigma) =`,
+          scaleSamples,
+        );
+        console.log(
+          `[training debug] ${label} grad_scale[0:${sampleGauss}] =`,
+          gradScaleSamples,
+        );
+      }
     } finally {
       stTrainOpacity.destroy();
       stGradOpacity.destroy();
       stGradAlphaSplat.destroy();
+      if (stTrainScale) stTrainScale.destroy();
+      if (stGradScale) stGradScale.destroy();
     }
+  }
+
+  async function debugDumpSplatRadii(label: string) {
+    if (active_count === 0) {
+      console.warn('[debugDumpSplatRadii] No active gaussians.');
+      return;
+    }
+    if (!splat_buffer) {
+      console.warn('[debugDumpSplatRadii] splat_buffer is null.');
+      return;
+    }
+    if (!sorter || !preprocess_bg) {
+      console.warn('[debugDumpSplatRadii] sorter or preprocess_bg not ready.');
+      return;
+    }
+
+    const sampleCount = Math.min(active_count, 32);
+    const strideFloats = BYTES_PER_SPLAT / FLOAT32_BYTES;
+    const bytes = sampleCount * BYTES_PER_SPLAT;
+
+    const encoder = device.createCommandEncoder();
+    run_preprocess(encoder);
+
+    const staging = device.createBuffer({
+      label: 'debug splat radii staging',
+      size: bytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    encoder.copyBufferToBuffer(splat_buffer, 0, staging, 0, bytes);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const copy = staging.getMappedRange().slice(0);
+    staging.unmap();
+    staging.destroy();
+
+    const floats = new Float32Array(copy);
+
+    let minR = Number.POSITIVE_INFINITY;
+    let maxR = Number.NEGATIVE_INFINITY;
+    let sumR = 0;
+    let count = 0;
+    const samples: Array<{ idx: number; center_ndc: number[]; radius: number[] }> = [];
+
+    for (let i = 0; i < sampleCount; i++) {
+      const base = i * strideFloats;
+      const center_ndc = [floats[base + 0], floats[base + 1]];
+      const radius = [floats[base + 2], floats[base + 3]];
+      const r = Math.max(radius[0], radius[1]);
+      if (Number.isFinite(r)) {
+        if (r < minR) minR = r;
+        if (r > maxR) maxR = r;
+        sumR += r;
+        count++;
+      }
+      if (samples.length < 16) {
+        samples.push({ idx: i, center_ndc, radius });
+      }
+    }
+
+    const meanR = count > 0 ? sumR / count : 0;
+    console.log(
+      `[training debug] ${label} splat radius sample stats (screen-space px): min=${minR}, max=${maxR}, mean=${meanR}, sampleCount=${count}`,
+    );
+    console.log(
+      `[training debug] ${label} splat radius samples[0:${samples.length}] =`,
+      samples,
+    );
   }
 
   function zeroGradBuffers() {
@@ -2342,12 +2506,15 @@ export default function get_renderer(
       }
     }
 
+    console.log(`[debugTrainOnce] Starting debug training step at iteration=${trainingIteration + 1}, active_count=${active_count}`);
+
     const encoder = device.createCommandEncoder();
     trainStep(encoder);
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
 
     await debugSampleTrainingState(label + ` (iter ${trainingIteration})`);
+    await debugDumpSplatRadii(label + ` (iter ${trainingIteration})`);
   }
 
   // ===============================================
@@ -2390,22 +2557,22 @@ export default function get_renderer(
         trainStep(encoder);
         trainingCount -= 1;
         camera.needsPreprocess = true;
-        const shouldDensify = trainingIteration % DENSIFY_INTERVAL === 0 && densify_bind_group && targetTextureView;
-        const shouldPrune = trainingIteration % PRUNE_INTERVAL === 0 && prune_bind_group;
-        
-        if (shouldDensify && shouldPrune) {
-          console.log(`Densifying at iteration ${trainingIteration}...`);
-          densify().catch(err => console.error('Densify error:', err));
-        } else {
-          if (shouldDensify) {
-            console.log(`Densifying at iteration ${trainingIteration}...`);
-            densify().catch(err => console.error('Densify error:', err));
-          }
-          if (shouldPrune) {
-            console.log(`Pruning at iteration ${trainingIteration}...`);
-            prune().catch(err => console.error('Prune error:', err));
-          }
-        }
+        // Temporarily disabled
+        // const shouldDensify = trainingIteration % DENSIFY_INTERVAL === 0 && densify_bind_group && targetTextureView;
+        // const shouldPrune = trainingIteration % PRUNE_INTERVAL === 0 && prune_bind_group;
+        // if (shouldDensify && shouldPrune) {
+        //   console.log(`Densifying at iteration ${trainingIteration}...`);
+        //   densify().catch(err => console.error('Densify error:', err));
+        // } else {
+        //   if (shouldDensify) {
+        //     console.log(`Densifying at iteration ${trainingIteration}...`);
+        //     densify().catch(err => console.error('Densify error:', err));
+        //   }
+        //   if (shouldPrune) {
+        //     console.log(`Pruning at iteration ${trainingIteration}...`);
+        //     prune().catch(err => console.error('Prune error:', err));
+        //   }
+        // }
       }
       if (camera.needsPreprocess) {
         run_preprocess(encoder);

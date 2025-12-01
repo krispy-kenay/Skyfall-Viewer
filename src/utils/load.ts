@@ -85,7 +85,8 @@ export async function load(file: string, device: GPUDevice) {
 
   var readOffset = 0;
   const defaultOpacity = 1.0;
-  const defaultScale = 0.01;
+  const defaultSigma = 0.01;
+  const defaultScale = Math.log(defaultSigma);
   const defaultRot = [0, 0, 0, 1];
 
   let minX = Infinity, maxX = -Infinity;
