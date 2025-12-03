@@ -6,6 +6,12 @@ import type { PointCloud } from './load';
 const C_SIZE_F16 = 2;
 const MAX_NUM_COEFFS = 16;
 
+const SH_C0 = 0.28209479177387814;
+
+function RGB2SH(rgb: number): number {
+  return (rgb - 0.5) / SH_C0;
+}
+
 export const C_SIZE_3D_GAUSSIAN =
   3 * C_SIZE_F16 + 
   C_SIZE_F16 +
@@ -45,7 +51,8 @@ export function createPointCloudFromXYZRGB(
   const sh = new Float16Array(sh_buffer.getMappedRange());
 
   const defaultOpacity = 1.0;
-  const defaultScale = 0.01;
+  const defaultSigma = 0.01;
+  const defaultScale = Math.log(defaultSigma);
   const defaultRot = [0, 0, 0, 1];
 
   let minX = Infinity, maxX = -Infinity;
@@ -63,9 +70,9 @@ export function createPointCloudFromXYZRGB(
     const r = rgb[i * 3 + 0] / 255.0;
     const g = rgb[i * 3 + 1] / 255.0;
     const b = rgb[i * 3 + 2] / 255.0;
-    sh[output_offset + 0] = r;
-    sh[output_offset + 1] = g;
-    sh[output_offset + 2] = b;
+    sh[output_offset + 0] = RGB2SH(r);
+    sh[output_offset + 1] = RGB2SH(g);
+    sh[output_offset + 2] = RGB2SH(b);
     for (let k = 3; k < MAX_NUM_COEFFS * 3; ++k) {
       sh[output_offset + k] = 0.0;
     }
