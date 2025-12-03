@@ -25,13 +25,12 @@ struct BackgroundParams {
 @group(0) @binding(7) var training_alpha : texture_storage_2d<r32float, write>;
 @group(0) @binding(8) var<storage, read_write> last_ids : array<u32>;
 
-@group(0) @binding(9) var<storage, read> gaussians : array<Gaussian>;
-@group(0) @binding(10) var<storage, read> sh_buffer : array<u32>;
-@group(0) @binding(11) var<uniform> background : BackgroundParams;
-@group(0) @binding(12) var<storage, read> tile_masks : array<u32>;
+@group(0) @binding(9) var<storage, read> sh_buffer : array<u32>;
+@group(0) @binding(10) var<uniform> background : BackgroundParams;
+@group(0) @binding(11) var<storage, read> tile_masks : array<u32>;
 
-@group(0) @binding(13) var<storage, read> tiles_cumsum : array<u32>;
-@group(0) @binding(14) var<uniform> active_count : u32;
+@group(0) @binding(12) var<storage, read> tiles_cumsum : array<u32>;
+@group(0) @binding(13) var<uniform> active_count : u32;
 
 const MAX_SH_COEFFS_TF : u32 = 16u;
 const SH_COMPONENTS_TF : u32 = MAX_SH_COEFFS_TF * 3u;
@@ -182,16 +181,11 @@ fn training_tiled_forward(@builtin(global_invocation_id) gid : vec3<u32>) {
             continue;
         }
 
-        let gg = gaussians[g_idx];
-        let p01 = unpack2x16float(gg.pos_opacity[0u]);
-        let p02 = unpack2x16float(gg.pos_opacity[1u]);
-
-        let position_world = vec4<f32>(p01.x, p01.y, p02.x, 1.0);
+        let position_world = vec4<f32>(gp.position_world, 1.0);
         let viewDir = normalize(-(camera.view * position_world).xyz);
         let sh_deg = u32(settings.sh_deg);
 
-        let base_opacity_logit = p02.y;
-        let opacity = 1.0 / (1.0 + exp(-base_opacity_logit));
+        let opacity = 1.0 / (1.0 + exp(-gp.opacity_logit));
 
         let vis_color = computeColorFromSH_tf(viewDir, g_idx, sh_deg);
 

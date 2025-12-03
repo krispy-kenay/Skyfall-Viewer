@@ -196,7 +196,7 @@ export default function get_renderer(
 
   // Tiling buffers
   const TILE_SIZE = 16;
-  const GAUSS_PROJECTION_BYTES = 32;
+  const GAUSS_PROJECTION_BYTES = 48;
   let tiling_params_buffer: GPUBuffer | null = null;
   let gauss_projections_buffer: GPUBuffer | null = null;
 
@@ -1209,7 +1209,7 @@ export default function get_renderer(
 
   function rebuildTrainingTiledForwardBG() {
     if (!training_tiled_forward_pipeline) return;
-    if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
+    if (!sh_buffer || !tiling_params_buffer) return;
     if (!gauss_projections_buffer) return;
     if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
     if (!training_color_view || !training_alpha_view || !training_last_ids_buffer) return;
@@ -1228,19 +1228,19 @@ export default function get_renderer(
         { binding: 6, resource: training_color_view },
         { binding: 7, resource: training_alpha_view },
         { binding: 8, resource: { buffer: training_last_ids_buffer } },
-        { binding: 9, resource: { buffer: gaussian_buffer } },
-        { binding: 10, resource: { buffer: sh_buffer } },
-        { binding: 11, resource: { buffer: background_params_buffer! } },
-        { binding: 12, resource: { buffer: tile_mask_buffer! } },
-        { binding: 13, resource: { buffer: tiles_cumsum_buffer } },
-        { binding: 14, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 9, resource: { buffer: sh_buffer } },
+        { binding: 10, resource: { buffer: background_params_buffer! } },
+        { binding: 11, resource: { buffer: tile_mask_buffer! } },
+        { binding: 12, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 13, resource: { buffer: active_count_uniform_buffer } },
       ],
     });
   }
 
   function rebuildTrainingTiledBackwardBG() {
     if (!training_tiled_backward_pipeline) return;
-    if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
+    if (!sh_buffer || !tiling_params_buffer) return;
+    if (!gauss_projections_buffer) return;
     if (!residual_color_view || !training_last_ids_buffer) return;
     if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
     if (!grad_sh_buffer || !grad_opacity_buffer || !grad_geom_buffer || !active_count_uniform_buffer) return;
@@ -1254,20 +1254,20 @@ export default function get_renderer(
         { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
         { binding: 1, resource: { buffer: settings_buffer } },
         { binding: 2, resource: { buffer: tiling_params_buffer } },
-        { binding: 3, resource: { buffer: gaussian_buffer } },
-        { binding: 4, resource: { buffer: sh_buffer } },
+        { binding: 3, resource: { buffer: sh_buffer } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer } },
         { binding: 5, resource: residual_color_view },
-        { binding: 16, resource: training_alpha_view },
-        { binding: 6, resource: { buffer: training_last_ids_buffer } },
-        { binding: 7, resource: { buffer: tile_offsets_buffer } },
-        { binding: 8, resource: { buffer: flatten_ids_buffer } },
-        { binding: 9, resource: { buffer: grad_sh_buffer } },
-        { binding: 10, resource: { buffer: grad_opacity_buffer } },
-        { binding: 11, resource: { buffer: active_count_uniform_buffer } },
-        { binding: 12, resource: { buffer: grad_geom_buffer } },
-        { binding: 13, resource: { buffer: background_params_buffer! } },
-        { binding: 14, resource: { buffer: tile_mask_buffer! } },
-        { binding: 15, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 6, resource: training_alpha_view },
+        { binding: 7, resource: { buffer: training_last_ids_buffer } },
+        { binding: 8, resource: { buffer: tile_offsets_buffer } },
+        { binding: 9, resource: { buffer: flatten_ids_buffer } },
+        { binding: 10, resource: { buffer: grad_sh_buffer } },
+        { binding: 11, resource: { buffer: grad_opacity_buffer } },
+        { binding: 12, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 13, resource: { buffer: grad_geom_buffer } },
+        { binding: 14, resource: { buffer: background_params_buffer! } },
+        { binding: 15, resource: { buffer: tile_mask_buffer! } },
+        { binding: 16, resource: { buffer: tiles_cumsum_buffer } },
       ],
     });
   }
@@ -2927,6 +2927,7 @@ export default function get_renderer(
     const flattenData = await readBuffer(flatten_ids_buffer, lastTileCoverageStats.totalIntersections * 4, 'flatten_ids');
     const flattenIds = new Uint32Array(flattenData);
 
+    // Read merged GaussProjection buffer and extract components
     const projData = await readBuffer(gauss_projections_buffer, active_count * GAUSS_PROJECTION_BYTES, 'gauss_projections');
     const projView = new DataView(projData);
     

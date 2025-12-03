@@ -18,6 +18,7 @@ struct ProjectionParams {
 @group(0) @binding(1) var<storage, read> gaussians : array<Gaussian>;
 @group(0) @binding(2) var<uniform> active_count : u32;
 @group(0) @binding(3) var<uniform> tiling : TilingParams;
+// Merged per-gaussian projection data (replaces means2d, radii, depths, tiles_per_gauss, conics)
 @group(0) @binding(4) var<storage, read_write> gauss_projections : array<GaussProjection>;
 @group(0) @binding(5) var<uniform> proj : ProjectionParams;
 
@@ -154,6 +155,8 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
     gauss_projections[base].radius = radius_px;
     gauss_projections[base].depth = depth_cam;
     gauss_projections[base].conic = vec3<f32>(aa, bb, cc);
+    gauss_projections[base].position_world = position_world.xyz;
+    gauss_projections[base].opacity_logit = p02.y;
 
     // Tile coverage
     let tile_size_f = f32(tiling.tile_size);

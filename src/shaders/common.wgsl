@@ -60,4 +60,6 @@ struct GaussProjection {
     depth: f32,
     conic: vec3<f32>,
     tiles_count: u32,
+    position_world: vec3<f32>,
+    opacity_logit: f32,
 };
