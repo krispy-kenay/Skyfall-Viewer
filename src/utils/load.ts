@@ -3,6 +3,12 @@ import { log, time, timeLog } from './simple-console';
 import { decodeHeader, readRawVertex ,nShCoeffs} from './plyreader';
 import { C_SIZE_3D_GAUSSIAN, C_SIZE_SH_COEF } from './pointcloud-loader';
 
+const SH_C0 = 0.28209479177387814;
+
+function RGB2SH(rgb: number): number {
+  return (rgb - 0.5) / SH_C0;
+}
+
 export type PointCloud = Awaited<ReturnType<typeof load>>;
 
 export async function load(file: string, device: GPUDevice) {
@@ -11,10 +17,10 @@ export async function load(file: string, device: GPUDevice) {
     const reader = new FileReader();
     
     reader.onload = function(event) {
-      resolve(event.target.result);  // Resolve the promise with the ArrayBuffer
+      resolve(event.target.result);
     };
 
-    reader.onerror = reject;  // Reject the promise in case of an error
+    reader.onerror = reject;
     reader.readAsArrayBuffer(blob);
   });
 
@@ -115,9 +121,9 @@ export async function load(file: string, device: GPUDevice) {
       const r = (r8 as number) / 255.0;
       const g = (g8 as number) / 255.0;
       const b = (b8 as number) / 255.0;
-      sh[output_offset + 0] = r;
-      sh[output_offset + 1] = g;
-      sh[output_offset + 2] = b;
+      sh[output_offset + 0] = RGB2SH(r);
+      sh[output_offset + 1] = RGB2SH(g);
+      sh[output_offset + 2] = RGB2SH(b);
       for (let k = 3; k < max_num_coefs * 3; ++k) {
         sh[output_offset + k] = 0.0;
       }

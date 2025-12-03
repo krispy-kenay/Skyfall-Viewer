@@ -3,11 +3,10 @@ import { Pane } from 'tweakpane';
 import * as TweakpaneFileImportPlugin from 'tweakpane-plugin-file-import';
 import { default as get_renderer_gaussian, GaussianRenderer } from './gaussian-renderer';
 import { default as get_renderer_pointcloud } from './point-cloud-renderer';
-import { Camera, load_camera_presets, load_satellite_camera, TrainingCameraData, load_all_training_cameras_from_transforms, CameraPreset} from '../camera/camera';
+import { Camera, TrainingCameraData } from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
 import { time, timeReturn } from '../utils/simple-console';
 import { loadColmapDatasetScene } from '../utils/dataset-loader';
-import { vec3, mat4 } from 'wgpu-matrix';
 
 export interface Renderer {
   frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => void,
@@ -27,8 +26,6 @@ export default async function init(
   let gaussian_renderer: GaussianRenderer | undefined; 
   let pointcloud_renderer: Renderer | undefined; 
   let renderer: Renderer | undefined; 
-  let cameras;
-  let satellite;
   let training_cameras_cache: TrainingCameraData[] = [];
   let currentTrainingCameraIndex = 0;
   let currentPointCloud: PointCloud | undefined;
@@ -39,7 +36,6 @@ export default async function init(
   const observer = new ResizeObserver(() => {
     canvas.width = canvas.clientWidth;
     canvas.height = canvas.clientHeight;
-
     camera.on_update_canvas();
   });
   observer.observe(canvas);
@@ -50,48 +46,11 @@ export default async function init(
     format: presentation_format,
     alphaMode: 'opaque',
   });
-  
-  async function loadImageToTexture(device: GPUDevice, source: File) {
-    let blob: Blob;
-    blob = source;
-    const imageBitmap = await createImageBitmap(blob);
-  
-    const texture = device.createTexture({
-      size: [imageBitmap.width, imageBitmap.height, 1],
-      format: 'rgba8unorm',
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.RENDER_ATTACHMENT,
-    });
-  
-    device.queue.copyExternalImageToTexture(
-      { source: imageBitmap },
-      { texture },
-      [imageBitmap.width, imageBitmap.height]
-    );
-  
-    return {
-      texture,
-      view: texture.createView(),
-      sampler: device.createSampler({
-        magFilter: 'linear',
-        minFilter: 'linear',
-        addressModeU: 'clamp-to-edge',
-        addressModeV: 'clamp-to-edge',
-      })
-    };
-  }
-  
 
-  // Tweakpane: easily adding tweak control for parameters.
   const params = {
     fps: 0.0,
     gaussian_multiplier: 1,
     renderer: 'pointcloud',
-    ply_file: '',
-    cam_file: '',
-    img_file: '',
     benchFrames: 300,
   };
 
@@ -136,9 +95,9 @@ export default async function init(
           gaussian_renderer.setTrainingCameras(dataset.trainingCameras);
           gaussian_renderer.setTrainingImages(dataset.trainingImages);
 
-          //const initEncoder = device.createCommandEncoder();
-          //gaussian_renderer.initializeKnn(initEncoder);
-          //device.queue.submit([initEncoder.finish()]);
+          console.log("Initializing k-NN density-aware scales...");
+          await gaussian_renderer.initializeKnnAndSync();
+          console.log("k-NN initialization complete.");
         }
 
         dataset_loaded = true;
@@ -166,7 +125,6 @@ export default async function init(
       'gaussian_multiplier',
       {min: 0, max: 1.5}
     ).on('change', (e) => {
-      //TODO: Bind constants to the gaussian renderer.
       clearTimeout(scaleDebounce);
       scaleDebounce = setTimeout(() => gaussian_renderer.setGaussianScale(e.value), 25);
     });
@@ -177,8 +135,8 @@ export default async function init(
     f.addButton({ title: 'Train' }).on('click', () => {
       if (gaussian_renderer) gaussian_renderer.train(1);
     });
-    f.addButton({ title: 'Train x50' }).on('click', () => {
-      if (gaussian_renderer) gaussian_renderer.train(50);
+    f.addButton({ title: 'Train x100' }).on('click', () => {
+      if (gaussian_renderer) gaussian_renderer.train(1000);
     });
     f.addButton({ title: 'Set Viewer to Random Training Camera' }).on('click', () => {
       if (training_cameras_cache.length === 0) {
@@ -202,26 +160,6 @@ export default async function init(
       runBenchmark();
     });
   }
-  
-
-  document.addEventListener('keydown', (event) => {
-    switch(event.key) {
-      case '0':
-      case '1':
-      case '2':
-      case '3':
-      case '4':
-      case '5':
-      case '6':
-      case '7':
-      case '8':
-      case '9':
-        const i = parseInt(event.key);
-        console.log(`set to camera preset ${i}`);
-        camera.set_preset(cameras[i]);
-        break;
-    }
-  });
 
   function runBenchmark() {
     isBenchmarking = true;
@@ -266,13 +204,12 @@ export default async function init(
     const f16 = new (window as any).Float16Array(copy) as Float32Array;
 
     const view = trainingCam.view as Float32Array;
-  const proj = trainingCam.proj as Float32Array;
-  const w = trainingCam.viewport[0];
-  const h = trainingCam.viewport[1];
-  const fx = trainingCam.focal[0];
-  const fy = trainingCam.focal[1];
-  const cx = trainingCam.center_px ? trainingCam.center_px[0] : w * 0.5;
-  const cy = trainingCam.center_px ? trainingCam.center_px[1] : h * 0.5;
+    const w = trainingCam.viewport[0];
+    const h = trainingCam.viewport[1];
+    const fx = trainingCam.focal[0];
+    const fy = trainingCam.focal[1];
+    const cx = trainingCam.center_px ? trainingCam.center_px[0] : w * 0.5;
+    const cy = trainingCam.center_px ? trainingCam.center_px[1] : h * 0.5;
 
     const sampleStep = Math.max(1, Math.floor(numPoints / 50000));
     let samples = 0;
@@ -285,14 +222,9 @@ export default async function init(
       const y = f16[base + 1];
       const z = f16[base + 2];
 
-      const Xc =
-        view[0] * x + view[4] * y + view[8] * z + view[12];
-      const Yc =
-        view[1] * x + view[5] * y + view[9] * z + view[13];
-      const Zc =
-        view[2] * x + view[6] * y + view[10] * z + view[14];
-      const Wc =
-        view[3] * x + view[7] * y + view[11] * z + view[15];
+      const Xc = view[0] * x + view[4] * y + view[8] * z + view[12];
+      const Yc = view[1] * x + view[5] * y + view[9] * z + view[13];
+      const Zc = view[2] * x + view[6] * y + view[10] * z + view[14];
 
       samples++;
       if (Zc <= 0) {

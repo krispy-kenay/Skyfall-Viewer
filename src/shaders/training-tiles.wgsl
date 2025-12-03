@@ -256,13 +256,6 @@ fn build_tile_offsets(@builtin(global_invocation_id) gid : vec3<u32>) {
     let n_tiles_total = n_tiles * num_cameras;
     let n_isects = tiles_cumsum[active_count - 1u];
 
-    if (i == 0u) {
-        for (var t: u32 = 0u; t < n_tiles_total + 1u; t = t + 1u) {
-            atomicStore(&tile_offsets[t], n_isects);
-        }
-    }
-    workgroupBarrier();
-
     if (i >= n_isects) {
         return;
     }
