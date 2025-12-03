@@ -196,12 +196,9 @@ export default function get_renderer(
 
   // Tiling buffers
   const TILE_SIZE = 16;
+  const GAUSS_PROJECTION_BYTES = 32;
   let tiling_params_buffer: GPUBuffer | null = null;
-  let tile_means2d_buffer: GPUBuffer | null = null;
-  let tile_radii_buffer: GPUBuffer | null = null;
-  let tile_depths_buffer: GPUBuffer | null = null;
-  let tiles_per_gauss_buffer: GPUBuffer | null = null;
-  let tile_conics_buffer: GPUBuffer | null = null;
+  let gauss_projections_buffer: GPUBuffer | null = null;
 
   let training_tiles_project_pipeline: GPUComputePipeline | null = null;
   let tiles_cumsum_buffer: GPUBuffer | null = null;
@@ -499,31 +496,9 @@ export default function get_renderer(
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    // Tiling projection buffers
-    tile_means2d_buffer = device.createBuffer({
-      label: 'tiling means2d (float32)',
-      size: newCapacity * 2 * FLOAT32_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    tile_radii_buffer = device.createBuffer({
-      label: 'tiling radii (float32)',
-      size: newCapacity * 2 * FLOAT32_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    tile_depths_buffer = device.createBuffer({
-      label: 'tiling depths (float32)',
-      size: newCapacity * FLOAT32_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    tiles_per_gauss_buffer = device.createBuffer({
-      label: 'tiling tiles_per_gauss (u32)',
-      size: newCapacity * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-
-    tile_conics_buffer = device.createBuffer({
-      label: 'tiling conics (float32)',
-      size: newCapacity * 3 * FLOAT32_BYTES,
+    gauss_projections_buffer = device.createBuffer({
+      label: 'tiling gauss_projections (GaussProjection)',
+      size: newCapacity * GAUSS_PROJECTION_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -1235,7 +1210,7 @@ export default function get_renderer(
   function rebuildTrainingTiledForwardBG() {
     if (!training_tiled_forward_pipeline) return;
     if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
-    if (!tile_means2d_buffer || !tile_conics_buffer) return;
+    if (!gauss_projections_buffer) return;
     if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
     if (!training_color_view || !training_alpha_view || !training_last_ids_buffer) return;
     if (!tiles_cumsum_buffer || !active_count_uniform_buffer) return;
@@ -1247,19 +1222,18 @@ export default function get_renderer(
         { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
         { binding: 1, resource: { buffer: settings_buffer } },
         { binding: 2, resource: { buffer: tiling_params_buffer } },
-        { binding: 3, resource: { buffer: tile_means2d_buffer } },
-        { binding: 4, resource: { buffer: tile_conics_buffer } },
-        { binding: 6, resource: { buffer: tile_offsets_buffer } },
-        { binding: 7, resource: { buffer: flatten_ids_buffer } },
-        { binding: 8, resource: training_color_view },
-        { binding: 9, resource: training_alpha_view },
-        { binding: 10, resource: { buffer: training_last_ids_buffer } },
-        { binding: 11, resource: { buffer: gaussian_buffer } },
-        { binding: 12, resource: { buffer: sh_buffer } },
-        { binding: 13, resource: { buffer: background_params_buffer! } },
-        { binding: 14, resource: { buffer: tile_mask_buffer! } },
-        { binding: 15, resource: { buffer: tiles_cumsum_buffer } },
-        { binding: 16, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 3, resource: { buffer: gauss_projections_buffer } },
+        { binding: 4, resource: { buffer: tile_offsets_buffer } },
+        { binding: 5, resource: { buffer: flatten_ids_buffer } },
+        { binding: 6, resource: training_color_view },
+        { binding: 7, resource: training_alpha_view },
+        { binding: 8, resource: { buffer: training_last_ids_buffer } },
+        { binding: 9, resource: { buffer: gaussian_buffer } },
+        { binding: 10, resource: { buffer: sh_buffer } },
+        { binding: 11, resource: { buffer: background_params_buffer! } },
+        { binding: 12, resource: { buffer: tile_mask_buffer! } },
+        { binding: 13, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 14, resource: { buffer: active_count_uniform_buffer } },
       ],
     });
   }
@@ -1363,8 +1337,7 @@ export default function get_renderer(
   function run_training_tiles_projection(encoder: GPUCommandEncoder) {
     if (!training_tiles_project_pipeline ||
         !gaussian_buffer ||
-        !tile_means2d_buffer || !tile_radii_buffer || !tile_depths_buffer || !tile_conics_buffer ||
-        !tiles_per_gauss_buffer ||
+        !gauss_projections_buffer ||
         !projection_params_buffer ||
         !active_count_uniform_buffer) {
       return;
@@ -1380,12 +1353,8 @@ export default function get_renderer(
         { binding: 1, resource: { buffer: gaussian_buffer } },
         { binding: 2, resource: { buffer: active_count_uniform_buffer } },
         { binding: 3, resource: { buffer: tiling_params_buffer! } },
-        { binding: 4, resource: { buffer: tile_means2d_buffer } },
-        { binding: 5, resource: { buffer: tile_radii_buffer } },
-        { binding: 6, resource: { buffer: tile_depths_buffer } },
-        { binding: 7, resource: { buffer: tiles_per_gauss_buffer } },
-        { binding: 12, resource: { buffer: tile_conics_buffer } },
-        { binding: 13, resource: { buffer: projection_params_buffer } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer } },
+        { binding: 5, resource: { buffer: projection_params_buffer } },
       ],
     });
 
@@ -1404,7 +1373,7 @@ export default function get_renderer(
     // Any call to this function is (re)building tiling data for the current state.
     tilesBuilt = false;
 
-    if (!tiles_per_gauss_buffer) {
+    if (!gauss_projections_buffer) {
       return;
     }
     if (active_count === 0) {
@@ -1415,19 +1384,23 @@ export default function get_renderer(
     const encoder = device.createCommandEncoder();
     run_training_tiles_projection(encoder);
 
-    const tilesSizeBytes = active_count * 4;
+    const projectionsSizeBytes = active_count * GAUSS_PROJECTION_BYTES;
     const staging = device.createBuffer({
-      label: 'tiling tiles_per_gauss staging',
-      size: tilesSizeBytes,
+      label: 'tiling gauss_projections staging',
+      size: projectionsSizeBytes,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
-    encoder.copyBufferToBuffer(tiles_per_gauss_buffer, 0, staging, 0, tilesSizeBytes);
+    encoder.copyBufferToBuffer(gauss_projections_buffer, 0, staging, 0, projectionsSizeBytes);
     device.queue.submit([encoder.finish()]);
 
     await device.queue.onSubmittedWorkDone();
     await staging.mapAsync(GPUMapMode.READ);
     const mapped = staging.getMappedRange();
-    const countsView = new Uint32Array(mapped.slice(0, tilesSizeBytes));
+    const dataView = new DataView(mapped);
+    const countsView = new Uint32Array(active_count);
+    for (let i = 0; i < active_count; i++) {
+      countsView[i] = dataView.getUint32(i * GAUSS_PROJECTION_BYTES + 28, true);
+    }
 
     const cumsum = new Uint32Array(active_count);
     let running = 0;
@@ -1483,7 +1456,7 @@ export default function get_renderer(
     }
 
     if (!training_tiles_emit_pipeline ||
-        !tile_means2d_buffer || !tile_radii_buffer || !tile_depths_buffer ||
+        !gauss_projections_buffer ||
         !tiles_cumsum_buffer ||
         !isect_ids_buffer || !flatten_ids_buffer ||
         !active_count_uniform_buffer) {
@@ -1499,13 +1472,10 @@ export default function get_renderer(
       entries: [
         { binding: 2, resource: { buffer: active_count_uniform_buffer! } },
         { binding: 3, resource: { buffer: tiling_params_buffer! } },
-        { binding: 4, resource: { buffer: tile_means2d_buffer! } },
-        { binding: 5, resource: { buffer: tile_radii_buffer! } },
-        { binding: 6, resource: { buffer: tile_depths_buffer! } },
-        { binding: 7, resource: { buffer: tiles_per_gauss_buffer! } },
-        { binding: 8, resource: { buffer: tiles_cumsum_buffer! } },
-        { binding: 9, resource: { buffer: isect_ids_buffer! } },
-        { binding: 10, resource: { buffer: flatten_ids_buffer! } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer! } },
+        { binding: 6, resource: { buffer: tiles_cumsum_buffer! } },
+        { binding: 7, resource: { buffer: isect_ids_buffer! } },
+        { binding: 8, resource: { buffer: flatten_ids_buffer! } },
       ],
     });
 
@@ -1591,9 +1561,9 @@ export default function get_renderer(
       entries: [
         { binding: 2, resource: { buffer: active_count_uniform_buffer! } },
         { binding: 3, resource: { buffer: tiling_params_buffer! } },
-        { binding: 8, resource: { buffer: tiles_cumsum_buffer! } },
-        { binding: 9, resource: { buffer: isect_ids_buffer! } },
-        { binding: 11, resource: { buffer: tile_offsets_buffer! } },
+        { binding: 6, resource: { buffer: tiles_cumsum_buffer! } },
+        { binding: 7, resource: { buffer: isect_ids_buffer! } },
+        { binding: 9, resource: { buffer: tile_offsets_buffer! } },
       ],
     });
 
@@ -1920,8 +1890,7 @@ export default function get_renderer(
       console.warn('training_tiles_project_pipeline is null, cannot run tiled training forward');
       return;
     }
-    if (!tile_means2d_buffer || !tile_conics_buffer || !tile_depths_buffer ||
-        !tile_offsets_buffer || !flatten_ids_buffer) {
+    if (!gauss_projections_buffer || !tile_offsets_buffer || !flatten_ids_buffer) {
       console.warn('Tiling buffers are not ready, call buildTrainingTiles() before tiled training');
       return;
     }
@@ -2901,8 +2870,8 @@ export default function get_renderer(
     backgroundUsed: [number, number, number];
     observation: string;
   } | null> {
-    if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_means2d_buffer || 
-        !tile_conics_buffer || !tile_depths_buffer || !gaussian_buffer || !lastTileCoverageStats) {
+    if (!tile_offsets_buffer || !flatten_ids_buffer || !gauss_projections_buffer || 
+        !gaussian_buffer || !lastTileCoverageStats) {
       console.warn('[tracePixelCompositing] Required buffers not available');
       return null;
     }
@@ -2958,14 +2927,21 @@ export default function get_renderer(
     const flattenData = await readBuffer(flatten_ids_buffer, lastTileCoverageStats.totalIntersections * 4, 'flatten_ids');
     const flattenIds = new Uint32Array(flattenData);
 
-    const means2dData = await readBuffer(tile_means2d_buffer, active_count * 8, 'means2d');
-    const means2d = new Float32Array(means2dData);
+    const projData = await readBuffer(gauss_projections_buffer, active_count * GAUSS_PROJECTION_BYTES, 'gauss_projections');
+    const projView = new DataView(projData);
     
-    const conicsData = await readBuffer(tile_conics_buffer, active_count * 12, 'conics');
-    const conics = new Float32Array(conicsData);
-    
-    const depthsData = await readBuffer(tile_depths_buffer, active_count * 4, 'depths');
-    const depths = new Float32Array(depthsData);
+    const means2d = new Float32Array(active_count * 2);
+    const conics = new Float32Array(active_count * 3);
+    const depths = new Float32Array(active_count);
+    for (let i = 0; i < active_count; i++) {
+      const base = i * GAUSS_PROJECTION_BYTES;
+      means2d[i * 2 + 0] = projView.getFloat32(base + 0, true);
+      means2d[i * 2 + 1] = projView.getFloat32(base + 4, true);
+      depths[i] = projView.getFloat32(base + 12, true);
+      conics[i * 3 + 0] = projView.getFloat32(base + 16, true);
+      conics[i * 3 + 1] = projView.getFloat32(base + 20, true);
+      conics[i * 3 + 2] = projView.getFloat32(base + 24, true);
+    }
 
     const gaussianData = await readBuffer(gaussian_buffer, active_count * C_SIZE_3D_GAUSSIAN, 'gaussians');
     const gaussians = new Uint16Array(gaussianData);
