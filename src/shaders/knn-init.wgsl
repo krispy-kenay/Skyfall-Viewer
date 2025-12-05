@@ -56,7 +56,8 @@ fn knn_init(@builtin(global_invocation_id) gid : vec3<u32>) {
     
     density_buffer[idx] = mean_dist;
     
-    let initial_sigma = mean_dist / 3.0;
+    let MAX_INITIAL_SIGMA = 0.1;
+    let initial_sigma = min(mean_dist / 3.0, MAX_INITIAL_SIGMA);
     let log_sigma = log(max(initial_sigma, 1e-6));
     
     var g = gaussians[idx];

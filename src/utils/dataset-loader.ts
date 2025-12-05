@@ -13,10 +13,7 @@ export interface SceneDataset {
   trainingImages: TrainingImageResource[];
 }
 
-/**
- * Load a full gaussian splat .ply file.
- * Supports both standard 3DGS PLY format and simple xyz+rgb point clouds.
- */
+
 export async function loadPlyFile(
   plyFile: string,
   device: GPUDevice
@@ -24,14 +21,6 @@ export async function loadPlyFile(
   return await loadPly(plyFile, device);
 }
 
-/**
- * Load a COLMAP-style dataset folder with sparse reconstruction.
- * Expected structure:
- *   /sparse/0/cameras.bin
- *   /sparse/0/images.bin
- *   /sparse/0/points3D.bin
- *   /images/...
- */
 export async function loadColmapDatasetScene(
   dirHandle: any,
   device: GPUDevice

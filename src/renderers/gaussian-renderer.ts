@@ -9,6 +9,8 @@ import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardTilesWGSL from '../shaders/training-forward-tiles.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
 import trainingBackwardTilesWGSL from '../shaders/training-backward-tiles.wgsl';
+import backwardTilesLocalWGSL from '../shaders/backward-tiles-local.wgsl';
+import backwardReduceWGSL from '../shaders/backward-reduce.wgsl';
 import trainingBackwardGeomWGSL from '../shaders/training-backward-geom.wgsl';
 import trainingTilesWGSL from '../shaders/training-tiles.wgsl';
 import trainingParamsWGSL from '../shaders/training-params.wgsl';
@@ -16,6 +18,7 @@ import adamWGSL from '../shaders/adam.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
+import { TrainingProfiler, setGlobalProfiler } from '../utils/training-profiler';
 
 export interface GaussianRenderer extends Renderer {
   setGaussianScale(value: number): void;
@@ -36,6 +39,9 @@ export interface GaussianRenderer extends Renderer {
   setTrainingCameras(cameras: TrainingCameraData[]): void;
   setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>): void;
   buildTrainingTiles(): Promise<void>;
+  enableProfiling?(enabled: boolean): void;
+  printProfilingReport?(): void;
+  profiledTrainStep?(): Promise<void>;
 }
 
 // ===============================================
@@ -207,6 +213,15 @@ export default function get_renderer(
   let tile_offsets_buffer: GPUBuffer | null = null;
   let num_intersections = 0;
 
+  // Wavefront backward pass buffers and pipelines
+  const TILE_GRAD_STRIDE = 54;
+  let tile_grads_buffer: GPUBuffer | null = null;
+  let backward_tiles_local_pipeline: GPUComputePipeline | null = null;
+  let backward_reduce_pipeline: GPUComputePipeline | null = null;
+  let backward_tiles_local_bind_group: GPUBindGroup | null = null;
+  let backward_reduce_bind_group: GPUBindGroup | null = null;
+  let useWavefrontBackward = true;
+
   // Per-pixel last gaussian index for tiled training forward
   let training_last_ids_buffer: GPUBuffer | null = null;
   let tile_sorter: any = null;
@@ -229,6 +244,10 @@ export default function get_renderer(
 
   // Async training loop state
   let isTraining = false;
+
+  // Performance profiler
+  const profiler = new TrainingProfiler(device);
+  setGlobalProfiler(profiler);
 
   function getCurrentTrainingCameraBuffer(): GPUBuffer {
     if (training_camera_buffers.length > 0 &&
@@ -820,6 +839,24 @@ export default function get_renderer(
     },
   });
 
+  backward_tiles_local_pipeline = device.createComputePipeline({
+    label: 'backward tiles local (wavefront phase 1)',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + backwardTilesLocalWGSL }),
+      entryPoint: 'backward_tiles_local',
+    },
+  });
+
+  backward_reduce_pipeline = device.createComputePipeline({
+    label: 'backward reduce (wavefront phase 2)',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + backwardReduceWGSL }),
+      entryPoint: 'backward_reduce',
+    },
+  });
+
   // ===============================================
   // Bind Group Creation Functions
   // ===============================================
@@ -1028,6 +1065,18 @@ export default function get_renderer(
       flatten_ids_buffer = device.createBuffer({
         label: 'tiling flatten_ids (u32)',
         size: requiredIntersections * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    const tileGradsSize = requiredIntersections * TILE_GRAD_STRIDE * 4;
+    if (!tile_grads_buffer || tileGradsSize > (tile_grads_buffer?.size ?? 0)) {
+      if (tile_grads_buffer) {
+        tile_grads_buffer.destroy();
+      }
+      tile_grads_buffer = device.createBuffer({
+        label: 'tile_grads (wavefront backward)',
+        size: Math.max(tileGradsSize, 256),
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
     }
@@ -1268,6 +1317,57 @@ export default function get_renderer(
         { binding: 14, resource: { buffer: background_params_buffer! } },
         { binding: 15, resource: { buffer: tile_mask_buffer! } },
         { binding: 16, resource: { buffer: tiles_cumsum_buffer } },
+      ],
+    });
+  }
+
+  function rebuildBackwardTilesLocalBG() {
+    if (!backward_tiles_local_pipeline) return;
+    if (!sh_buffer || !tiling_params_buffer || !gauss_projections_buffer) return;
+    if (!residual_color_view || !training_alpha_view || !training_last_ids_buffer) return;
+    if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
+    if (!tiles_cumsum_buffer || !active_count_uniform_buffer || !tile_grads_buffer) return;
+
+    backward_tiles_local_bind_group = device.createBindGroup({
+      label: 'backward tiles local bind group',
+      layout: backward_tiles_local_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
+        { binding: 1, resource: { buffer: settings_buffer } },
+        { binding: 2, resource: { buffer: tiling_params_buffer } },
+        { binding: 3, resource: { buffer: sh_buffer } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer } },
+        { binding: 5, resource: residual_color_view },
+        { binding: 6, resource: training_alpha_view },
+        { binding: 7, resource: { buffer: training_last_ids_buffer } },
+        { binding: 8, resource: { buffer: tile_offsets_buffer } },
+        { binding: 9, resource: { buffer: flatten_ids_buffer } },
+        { binding: 10, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 11, resource: { buffer: background_params_buffer! } },
+        { binding: 12, resource: { buffer: tile_mask_buffer! } },
+        { binding: 13, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 14, resource: { buffer: tile_grads_buffer } },
+      ],
+    });
+  }
+
+  function rebuildBackwardReduceBG() {
+    if (!backward_reduce_pipeline) return;
+    if (!tile_grads_buffer || !flatten_ids_buffer || !tiles_cumsum_buffer) return;
+    if (!grad_sh_buffer || !grad_opacity_buffer || !grad_geom_buffer) return;
+    if (!active_count_uniform_buffer) return;
+
+    backward_reduce_bind_group = device.createBindGroup({
+      label: 'backward reduce bind group',
+      layout: backward_reduce_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: tile_grads_buffer } },
+        { binding: 1, resource: { buffer: flatten_ids_buffer } },
+        { binding: 2, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 3, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 4, resource: { buffer: grad_sh_buffer } },
+        { binding: 5, resource: { buffer: grad_opacity_buffer } },
+        { binding: 6, resource: { buffer: grad_geom_buffer } },
       ],
     });
   }
@@ -1948,22 +2048,64 @@ export default function get_renderer(
       return;
     }
 
-    rebuildTrainingTiledBackwardBG();
-    if (!training_tiled_backward_bind_group) {
-      console.warn('training_tiled_backward_bind_group is null, skipping tiled training_backward dispatch');
+    if (useWavefrontBackward && tile_grads_buffer) {
+      run_wavefront_backward(encoder);
+    } else {
+      rebuildTrainingTiledBackwardBG();
+      if (!training_tiled_backward_bind_group) {
+        console.warn('training_tiled_backward_bind_group is null, skipping tiled training_backward dispatch');
+        return;
+      }
+
+      const wgSizeX = 8;
+      const wgSizeY = 8;
+      const numGroupsX = Math.ceil(canvas.width / wgSizeX);
+      const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+
+      const pass = encoder.beginComputePass({ label: 'training tiled backward' });
+      pass.setPipeline(training_tiled_backward_pipeline);
+      pass.setBindGroup(0, training_tiled_backward_bind_group);
+      pass.dispatchWorkgroups(numGroupsX, numGroupsY);
+      pass.end();
+    }
+  }
+
+  function run_wavefront_backward(encoder: GPUCommandEncoder) {
+    rebuildBackwardTilesLocalBG();
+    if (!backward_tiles_local_bind_group) {
+      console.warn('backward_tiles_local_bind_group is null, falling back to old backward');
+      useWavefrontBackward = false;
+      run_training_tiled_backward(encoder);
       return;
     }
 
-    const wgSizeX = 8;
-    const wgSizeY = 8;
-    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
-    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+    const tilesX = Math.ceil(canvas.width / TILE_SIZE);
+    const tilesY = Math.ceil(canvas.height / TILE_SIZE);
 
-    const pass = encoder.beginComputePass({ label: 'training tiled backward' });
-    pass.setPipeline(training_tiled_backward_pipeline);
-    pass.setBindGroup(0, training_tiled_backward_bind_group);
-    pass.dispatchWorkgroups(numGroupsX, numGroupsY);
-    pass.end();
+    const pass1 = encoder.beginComputePass({ label: 'backward tiles local (phase 1)' });
+    pass1.setPipeline(backward_tiles_local_pipeline!);
+    pass1.setBindGroup(0, backward_tiles_local_bind_group);
+    pass1.dispatchWorkgroups(tilesX, tilesY);
+    pass1.end();
+
+    rebuildBackwardReduceBG();
+    if (!backward_reduce_bind_group) {
+      console.warn('backward_reduce_bind_group is null');
+      return;
+    }
+
+    const n_isects = lastTileCoverageStats?.totalIntersections ?? 0;
+    if (n_isects === 0) {
+      return;
+    }
+
+    const numReduceGroups = Math.ceil(n_isects / 256);
+
+    const pass2 = encoder.beginComputePass({ label: 'backward reduce (phase 2)' });
+    pass2.setPipeline(backward_reduce_pipeline!);
+    pass2.setBindGroup(0, backward_reduce_bind_group);
+    pass2.dispatchWorkgroups(numReduceGroups);
+    pass2.end();
   }
 
   function run_training_backward_geom(encoder: GPUCommandEncoder) {
@@ -3681,7 +3823,7 @@ export default function get_renderer(
 
     updateShDegreeSchedule();
 
-    // Forward -> Loss -> Backward -> Adam (tiled path is now canonical)
+    // Forward -> Loss -> Backward -> Adam
     run_training_tiled_forward(encoder);
     run_training_loss(encoder);
     run_training_tiled_backward(encoder);
@@ -3689,6 +3831,85 @@ export default function get_renderer(
     run_adam_updates(encoder);
     rebuildTrainingApplyParamsBG();
     run_training_apply_params(encoder);
+
+    camera.needsPreprocess = true;
+  }
+
+  async function profiledTrainStep(): Promise<void> {
+    if (training_camera_buffers.length > 0) {
+      current_training_camera_index = trainingIteration % training_camera_buffers.length;
+    }
+
+    const stats = lastTileCoverageStats;
+    profiler.setStats(
+      active_count,
+      stats ? stats.totalTiles : 0,
+      stats ? stats.totalIntersections : 0
+    );
+
+    await profiler.startIteration(trainingIteration);
+    trainingIteration++;
+
+    await profiler.startPass('zeroGradBuffers');
+    {
+      const encoder = device.createCommandEncoder();
+      zeroGradBuffers();
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('zeroGradBuffers');
+
+    updateShDegreeSchedule();
+
+    await profiler.startPass('forward');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_tiled_forward(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('forward');
+
+    await profiler.startPass('loss');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_loss(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('loss');
+
+    await profiler.startPass('backward_tiles');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_tiled_backward(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('backward_tiles');
+
+    await profiler.startPass('backward_geom');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_backward_geom(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('backward_geom');
+
+    await profiler.startPass('adam');
+    {
+      const encoder = device.createCommandEncoder();
+      run_adam_updates(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('adam');
+
+    await profiler.startPass('apply_params');
+    {
+      const encoder = device.createCommandEncoder();
+      rebuildTrainingApplyParamsBG();
+      run_training_apply_params(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('apply_params');
+
+    await profiler.endIteration();
 
     camera.needsPreprocess = true;
   }
@@ -3857,5 +4078,8 @@ export default function get_renderer(
     debugTracePixel,
     getTileCoverageStats,
     buildTrainingTiles: buildTileIntersections,
+    enableProfiling: (enabled: boolean) => profiler.setEnabled(enabled),
+    printProfilingReport: () => profiler.printReport(),
+    profiledTrainStep,
   };
 }
