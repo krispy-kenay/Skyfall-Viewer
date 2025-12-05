@@ -16,27 +16,27 @@ struct BackgroundParams {
 @group(0) @binding(1) var<uniform> settings: RenderSettings;
 @group(0) @binding(2) var<uniform> tiling : TilingParams;
 
-@group(0) @binding(3) var<storage, read> gaussians : array<Gaussian>;
-@group(0) @binding(4) var<storage, read> sh_buffer : array<u32>;
+@group(0) @binding(3) var<storage, read> sh_buffer : array<u32>;
+@group(0) @binding(4) var<storage, read> gauss_projections : array<GaussProjection>;
 
 @group(0) @binding(5) var residual_color : texture_storage_2d<rgba32float, read>;
-@group(0) @binding(16) var training_alpha : texture_storage_2d<r32float, read>;
+@group(0) @binding(6) var training_alpha : texture_storage_2d<r32float, read>;
 
-@group(0) @binding(6) var<storage, read> last_ids : array<u32>;
-@group(0) @binding(7) var<storage, read> tile_offsets : array<u32>;
-@group(0) @binding(8) var<storage, read> flatten_ids : array<u32>;
+@group(0) @binding(7) var<storage, read> last_ids : array<u32>;
+@group(0) @binding(8) var<storage, read> tile_offsets : array<u32>;
+@group(0) @binding(9) var<storage, read> flatten_ids : array<u32>;
 
-@group(0) @binding(9) var<storage, read_write> grad_sh : array<atomic<u32>>;
-@group(0) @binding(10) var<storage, read_write> grad_opacity : array<atomic<u32>>;
+@group(0) @binding(10) var<storage, read_write> grad_sh : array<atomic<u32>>;
+@group(0) @binding(11) var<storage, read_write> grad_opacity : array<atomic<u32>>;
 
-@group(0) @binding(11) var<uniform> active_count : u32;
+@group(0) @binding(12) var<uniform> active_count : u32;
 
-@group(0) @binding(12) var<storage, read_write> grad_geom : array<atomic<u32>>;
+@group(0) @binding(13) var<storage, read_write> grad_geom : array<atomic<u32>>;
 
-@group(0) @binding(13) var<uniform> background : BackgroundParams;
-@group(0) @binding(14) var<storage, read> tile_masks : array<u32>;
+@group(0) @binding(14) var<uniform> background : BackgroundParams;
+@group(0) @binding(15) var<storage, read> tile_masks : array<u32>;
 
-@group(0) @binding(15) var<storage, read> tiles_cumsum : array<u32>;
+@group(0) @binding(16) var<storage, read> tiles_cumsum : array<u32>;
 
 const MAX_SH_COEFFS_TB : u32 = 16u;
 const SH_COMPONENTS_TB : u32 = MAX_SH_COEFFS_TB * 3u;
@@ -66,15 +66,6 @@ const GEOM_GRAD_CONIC_C  : u32 = 2u;
 const GEOM_GRAD_MEAN2D_X : u32 = 3u;
 const GEOM_GRAD_MEAN2D_Y : u32 = 4u;
 const GEOM_GRAD_STRIDE   : u32 = 5u;
-
-fn quat_to_mat3_tiling_bw(q: vec4<f32>) -> mat3x3<f32> {
-    let rx = q[0]; let ry = q[1]; let rz = q[2]; let rw = q[3];
-    return mat3x3<f32>(
-        1.0 - 2.0*(ry * ry + rz * rz),  2.0*(rx * ry - rw * rz),        2.0*(rx * rz + rw * ry),
-        2.0*(rx * ry + rw * rz),        1.0 - 2.0*(rx * rx + rz * rz),  2.0*(ry * rz - rw * rx),
-        2.0*(rx * rz - rw * ry),        2.0*(ry * rz + rw * rx),        1.0 - 2.0*(rx * rx + ry * ry)
-    );
-}
 
 fn read_f16_coeff_tb(base_word: u32, elem: u32) -> f32 {
     let word_idx = base_word + (elem >> 1u);
@@ -333,67 +324,15 @@ fn training_tiled_backward(@builtin(global_invocation_id) gid : vec3<u32>) {
         
         let g_idx = flatten_ids[i];
 
-        let gg = gaussians[g_idx];
-        let p01 = unpack2x16float(gg.pos_opacity[0u]);
-        let p02 = unpack2x16float(gg.pos_opacity[1u]);
-        let r01 = unpack2x16float(gg.rot[0u]);
-        let r02 = unpack2x16float(gg.rot[1u]);
-        let s01 = unpack2x16float(gg.scale[0u]);
-        let s02 = unpack2x16float(gg.scale[1u]);
+        let gp = gauss_projections[g_idx];
+        let center_px = gp.mean2d;
+        let aa = gp.conic.x;
+        let bb = gp.conic.y;
+        let cc = gp.conic.z;
 
-        let position_world = vec4<f32>(p01.x, p01.y, p02.x, 1.0);
-        let position_camera = camera.view * position_world;
-        var position_clip = camera.proj * position_camera;
-        position_clip /= position_clip.w;
-
-        let log_sigma = vec3<f32>(
-            clamp(s01.x, -10.0, 10.0),
-            clamp(s01.y, -10.0, 10.0),
-            clamp(s02.x, -10.0, 10.0)
-        );
-        let sigma = exp(log_sigma);
-
-        let S = mat3x3<f32>(
-            sigma.x, 0.0,    0.0,
-            0.0,    sigma.y, 0.0,
-            0.0,    0.0,    sigma.z
-        );
-
-        let q = normalize(vec4<f32>(r01.y, r02.x, r02.y, r01.x));
-        let R = quat_to_mat3_tiling_bw(q);
-
-        let C3D = transpose(S * R) * S * R;
-
-        let t_cam = position_camera.xyz;
-        let fx = camera.focal.x;
-        let fy = camera.focal.y;
-        let J = mat3x3<f32>(
-            fx / t_cam.z, 0.0, - (fx * t_cam.x) / (t_cam.z * t_cam.z),
-            0.0, fy / t_cam.z, - (fy * t_cam.y) / (t_cam.z * t_cam.z),
-            0.0, 0.0, 0.0
-        );
-
-        let Rwc = mat3x3<f32>(camera.view[0].xyz, camera.view[1].xyz, camera.view[2].xyz);
-        let T_mat = J * Rwc;
-
-        var C2D = T_mat * C3D * transpose(T_mat);
-
-        C2D[0][0] += 0.3;
-        C2D[1][1] += 0.3;
-
-        let det = C2D[0][0] * C2D[1][1] - C2D[0][1] * C2D[0][1];
-        if (det <= 0.0) {
+        if (gp.tiles_count == 0u) {
             continue;
         }
-
-        let det_inv = 1.0 / det;
-        let aa = C2D[1][1] * det_inv;
-        let bb = -C2D[0][1] * det_inv;
-        let cc = C2D[0][0] * det_inv;
-
-        let img_dims = vec2<f32>(f32(tiling.image_width), f32(tiling.image_height));
-        let ndc = position_clip.xy;
-        let center_px = 0.5 * (ndc + vec2<f32>(1.0, 1.0)) * img_dims;
 
         let pixel = vec2<f32>(px, py);
         let d = pixel - center_px;
@@ -405,11 +344,11 @@ fn training_tiled_backward(@builtin(global_invocation_id) gid : vec3<u32>) {
 
         let gaussian = exp(-sigma_over_2);
 
+        let position_world = vec4<f32>(gp.position_world, 1.0);
         let viewDir = normalize(-(camera.view * position_world).xyz);
         let sh_deg = u32(settings.sh_deg);
 
-        let base_opacity_logit = p02.y;
-        let opacity = 1.0 / (1.0 + exp(-base_opacity_logit));
+        let opacity = 1.0 / (1.0 + exp(-gp.opacity_logit));
 
         let alpha_local = opacity * gaussian;
         let alpha_splat = min(alpha_local, MAX_FRAGMENT_ALPHA_TB);

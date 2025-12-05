@@ -18,17 +18,14 @@ struct ProjectionParams {
 @group(0) @binding(1) var<storage, read> gaussians : array<Gaussian>;
 @group(0) @binding(2) var<uniform> active_count : u32;
 @group(0) @binding(3) var<uniform> tiling : TilingParams;
-@group(0) @binding(4) var<storage, read_write> means2d : array<vec2<f32>>;
-@group(0) @binding(5) var<storage, read_write> radii : array<vec2<f32>>;
-@group(0) @binding(6) var<storage, read_write> depths : array<f32>;
-@group(0) @binding(7) var<storage, read_write> tiles_per_gauss : array<u32>;
-@group(0) @binding(12) var<storage, read_write> conics : array<vec3<f32>>;
-@group(0) @binding(13) var<uniform> proj : ProjectionParams;
+// Merged per-gaussian projection data (replaces means2d, radii, depths, tiles_per_gauss, conics)
+@group(0) @binding(4) var<storage, read_write> gauss_projections : array<GaussProjection>;
+@group(0) @binding(5) var<uniform> proj : ProjectionParams;
 
-@group(0) @binding(8) var<storage, read> tiles_cumsum : array<u32>;
-@group(0) @binding(9) var<storage, read_write> isect_ids : array<u32>;
-@group(0) @binding(10) var<storage, read_write> flatten_ids : array<u32>;
-@group(0) @binding(11) var<storage, read_write> tile_offsets : array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read> tiles_cumsum : array<u32>;
+@group(0) @binding(7) var<storage, read_write> isect_ids : array<u32>;
+@group(0) @binding(8) var<storage, read_write> flatten_ids : array<u32>;
+@group(0) @binding(9) var<storage, read_write> tile_offsets : array<atomic<u32>>;
 
 fn quat_to_mat3_tiling(q: vec4<f32>) -> mat3x3<f32> {
     let rx = q[0]; let ry = q[1]; let rz = q[2]; let rw = q[3];
@@ -68,17 +65,17 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
     position_clip /= position_clip.w;
 
     if (abs(position_clip.x) > 1.2 || abs(position_clip.y) > 1.2 || position_camera.z <= 0.0) {
-        tiles_per_gauss[base] = 0u;
-        radii[base] = vec2<f32>(0.0, 0.0);
-        depths[base] = 0.0;
+        gauss_projections[base].tiles_count = 0u;
+        gauss_projections[base].radius = 0.0;
+        gauss_projections[base].depth = 0.0;
         return;
     }
 
     let depth_cam = position_camera.z;
     if (depth_cam < proj.near_plane || depth_cam > proj.far_plane) {
-        tiles_per_gauss[base] = 0u;
-        radii[base] = vec2<f32>(0.0, 0.0);
-        depths[base] = 0.0;
+        gauss_projections[base].tiles_count = 0u;
+        gauss_projections[base].radius = 0.0;
+        gauss_projections[base].depth = 0.0;
         return;
     }
 
@@ -122,10 +119,9 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
 
     let det = C2D[0][0] * C2D[1][1] - C2D[0][1] * C2D[0][1];
     if (det <= 0.0) {
-        let base = camera_id * n + gauss_idx;
-        tiles_per_gauss[base] = 0u;
-        radii[base] = vec2<f32>(0.0, 0.0);
-        depths[base] = 0.0;
+        gauss_projections[base].tiles_count = 0u;
+        gauss_projections[base].radius = 0.0;
+        gauss_projections[base].depth = 0.0;
         return;
     }
 
@@ -137,10 +133,9 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
 
     // Discard gaussians with excessively large or tiny projected radius.
     if (radius_px > proj.radius_clip || radius_px < 1.0) {
-        let base = camera_id * n + gauss_idx;
-        tiles_per_gauss[base] = 0u;
-        radii[base] = vec2<f32>(0.0, 0.0);
-        depths[base] = 0.0;
+        gauss_projections[base].tiles_count = 0u;
+        gauss_projections[base].radius = 0.0;
+        gauss_projections[base].depth = 0.0;
         return;
     }
 
@@ -154,10 +149,14 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
     let dims = vec2<f32>(f32(tiling.image_width), f32(tiling.image_height));
     let ndc = position_clip.xy;
     let mean_px = 0.5 * (ndc + vec2<f32>(1.0, 1.0)) * dims;
-    means2d[base] = mean_px;
-    radii[base] = vec2<f32>(radius_px, radius_px);
-    depths[base] = depth_cam;
-    conics[base] = vec3<f32>(aa, bb, cc);
+    
+    // Write to merged GaussProjection buffer
+    gauss_projections[base].mean2d = mean_px;
+    gauss_projections[base].radius = radius_px;
+    gauss_projections[base].depth = depth_cam;
+    gauss_projections[base].conic = vec3<f32>(aa, bb, cc);
+    gauss_projections[base].position_world = position_world.xyz;
+    gauss_projections[base].opacity_logit = p02.y;
 
     // Tile coverage
     let tile_size_f = f32(tiling.tile_size);
@@ -166,8 +165,6 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
     let tile_radius_x = radius_px / tile_size_f;
     let tile_radius_y = radius_px / tile_size_f;
 
-    let tw = f32(tiling.tile_width);
-    let th = f32(tiling.tile_height);
     let tile_min_x = min(max(0u, u32(floor(tile_x - tile_radius_x))), tiling.tile_width);
     let tile_min_y = min(max(0u, u32(floor(tile_y - tile_radius_y))), tiling.tile_height);
     let tile_max_x = min(max(0u, u32(ceil(tile_x + tile_radius_x))), tiling.tile_width);
@@ -176,9 +173,9 @@ fn project_gaussians_for_tiling(@builtin(global_invocation_id) gid : vec3<u32>) 
     let tiles_x = i32(tile_max_x) - i32(tile_min_x);
     let tiles_y = i32(tile_max_y) - i32(tile_min_y);
     if (tiles_x <= 0 || tiles_y <= 0) {
-        tiles_per_gauss[base] = 0u;
+        gauss_projections[base].tiles_count = 0u;
     } else {
-        tiles_per_gauss[base] = u32(tiles_x * tiles_y);
+        gauss_projections[base].tiles_count = u32(tiles_x * tiles_y);
     }
 }
 
@@ -208,7 +205,8 @@ fn emit_intersections(@builtin(global_invocation_id) gid : vec3<u32>) {
         return;
     }
 
-    let tiles_count = tiles_per_gauss[idx];
+    let gp = gauss_projections[idx];
+    let tiles_count = gp.tiles_count;
     if (tiles_count == 0u) {
         return;
     }
@@ -220,9 +218,9 @@ fn emit_intersections(@builtin(global_invocation_id) gid : vec3<u32>) {
         start = tiles_cumsum[idx - 1u];
     }
 
-    let mean_px = means2d[idx];
-    let radius_px = radii[idx].x;
-    let depth_val = depths[idx];
+    let mean_px = gp.mean2d;
+    let radius_px = gp.radius;
+    let depth_val = gp.depth;
 
     let tile_size_f = f32(tiling.tile_size);
     let tile_x = mean_px.x / tile_size_f;

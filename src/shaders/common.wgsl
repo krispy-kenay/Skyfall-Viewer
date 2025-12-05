@@ -53,3 +53,13 @@ struct Splat {
     a22 : f32,
     opacity: f32,
 };
+
+struct GaussProjection {
+    mean2d: vec2<f32>,
+    radius: f32,
+    depth: f32,
+    conic: vec3<f32>,
+    tiles_count: u32,
+    position_world: vec3<f32>,
+    opacity_logit: f32,
+};

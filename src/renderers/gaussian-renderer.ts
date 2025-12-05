@@ -9,6 +9,8 @@ import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardTilesWGSL from '../shaders/training-forward-tiles.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
 import trainingBackwardTilesWGSL from '../shaders/training-backward-tiles.wgsl';
+import backwardTilesLocalWGSL from '../shaders/backward-tiles-local.wgsl';
+import backwardReduceWGSL from '../shaders/backward-reduce.wgsl';
 import trainingBackwardGeomWGSL from '../shaders/training-backward-geom.wgsl';
 import trainingTilesWGSL from '../shaders/training-tiles.wgsl';
 import trainingParamsWGSL from '../shaders/training-params.wgsl';
@@ -16,6 +18,7 @@ import adamWGSL from '../shaders/adam.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
+import { TrainingProfiler, setGlobalProfiler } from '../utils/training-profiler';
 
 export interface GaussianRenderer extends Renderer {
   setGaussianScale(value: number): void;
@@ -36,6 +39,9 @@ export interface GaussianRenderer extends Renderer {
   setTrainingCameras(cameras: TrainingCameraData[]): void;
   setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>): void;
   buildTrainingTiles(): Promise<void>;
+  enableProfiling?(enabled: boolean): void;
+  printProfilingReport?(): void;
+  profiledTrainStep?(): Promise<void>;
 }
 
 // ===============================================
@@ -196,12 +202,9 @@ export default function get_renderer(
 
   // Tiling buffers
   const TILE_SIZE = 16;
+  const GAUSS_PROJECTION_BYTES = 48;
   let tiling_params_buffer: GPUBuffer | null = null;
-  let tile_means2d_buffer: GPUBuffer | null = null;
-  let tile_radii_buffer: GPUBuffer | null = null;
-  let tile_depths_buffer: GPUBuffer | null = null;
-  let tiles_per_gauss_buffer: GPUBuffer | null = null;
-  let tile_conics_buffer: GPUBuffer | null = null;
+  let gauss_projections_buffer: GPUBuffer | null = null;
 
   let training_tiles_project_pipeline: GPUComputePipeline | null = null;
   let tiles_cumsum_buffer: GPUBuffer | null = null;
@@ -209,6 +212,15 @@ export default function get_renderer(
   let flatten_ids_buffer: GPUBuffer | null = null;
   let tile_offsets_buffer: GPUBuffer | null = null;
   let num_intersections = 0;
+
+  // Wavefront backward pass buffers and pipelines
+  const TILE_GRAD_STRIDE = 54;
+  let tile_grads_buffer: GPUBuffer | null = null;
+  let backward_tiles_local_pipeline: GPUComputePipeline | null = null;
+  let backward_reduce_pipeline: GPUComputePipeline | null = null;
+  let backward_tiles_local_bind_group: GPUBindGroup | null = null;
+  let backward_reduce_bind_group: GPUBindGroup | null = null;
+  let useWavefrontBackward = true;
 
   // Per-pixel last gaussian index for tiled training forward
   let training_last_ids_buffer: GPUBuffer | null = null;
@@ -232,6 +244,10 @@ export default function get_renderer(
 
   // Async training loop state
   let isTraining = false;
+
+  // Performance profiler
+  const profiler = new TrainingProfiler(device);
+  setGlobalProfiler(profiler);
 
   function getCurrentTrainingCameraBuffer(): GPUBuffer {
     if (training_camera_buffers.length > 0 &&
@@ -499,31 +515,9 @@ export default function get_renderer(
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    // Tiling projection buffers
-    tile_means2d_buffer = device.createBuffer({
-      label: 'tiling means2d (float32)',
-      size: newCapacity * 2 * FLOAT32_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    tile_radii_buffer = device.createBuffer({
-      label: 'tiling radii (float32)',
-      size: newCapacity * 2 * FLOAT32_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    tile_depths_buffer = device.createBuffer({
-      label: 'tiling depths (float32)',
-      size: newCapacity * FLOAT32_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-    tiles_per_gauss_buffer = device.createBuffer({
-      label: 'tiling tiles_per_gauss (u32)',
-      size: newCapacity * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
-
-    tile_conics_buffer = device.createBuffer({
-      label: 'tiling conics (float32)',
-      size: newCapacity * 3 * FLOAT32_BYTES,
+    gauss_projections_buffer = device.createBuffer({
+      label: 'tiling gauss_projections (GaussProjection)',
+      size: newCapacity * GAUSS_PROJECTION_BYTES,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -845,6 +839,24 @@ export default function get_renderer(
     },
   });
 
+  backward_tiles_local_pipeline = device.createComputePipeline({
+    label: 'backward tiles local (wavefront phase 1)',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + backwardTilesLocalWGSL }),
+      entryPoint: 'backward_tiles_local',
+    },
+  });
+
+  backward_reduce_pipeline = device.createComputePipeline({
+    label: 'backward reduce (wavefront phase 2)',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + backwardReduceWGSL }),
+      entryPoint: 'backward_reduce',
+    },
+  });
+
   // ===============================================
   // Bind Group Creation Functions
   // ===============================================
@@ -1057,6 +1069,18 @@ export default function get_renderer(
       });
     }
 
+    const tileGradsSize = requiredIntersections * TILE_GRAD_STRIDE * 4;
+    if (!tile_grads_buffer || tileGradsSize > (tile_grads_buffer?.size ?? 0)) {
+      if (tile_grads_buffer) {
+        tile_grads_buffer.destroy();
+      }
+      tile_grads_buffer = device.createBuffer({
+        label: 'tile_grads (wavefront backward)',
+        size: Math.max(tileGradsSize, 256),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
     if (!tile_offsets_buffer || (totalTiles + 1) * 4 > (tile_offsets_buffer?.size ?? 0)) {
       if (tile_offsets_buffer) {
         tile_offsets_buffer.destroy();
@@ -1234,8 +1258,8 @@ export default function get_renderer(
 
   function rebuildTrainingTiledForwardBG() {
     if (!training_tiled_forward_pipeline) return;
-    if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
-    if (!tile_means2d_buffer || !tile_conics_buffer) return;
+    if (!sh_buffer || !tiling_params_buffer) return;
+    if (!gauss_projections_buffer) return;
     if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
     if (!training_color_view || !training_alpha_view || !training_last_ids_buffer) return;
     if (!tiles_cumsum_buffer || !active_count_uniform_buffer) return;
@@ -1247,26 +1271,25 @@ export default function get_renderer(
         { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
         { binding: 1, resource: { buffer: settings_buffer } },
         { binding: 2, resource: { buffer: tiling_params_buffer } },
-        { binding: 3, resource: { buffer: tile_means2d_buffer } },
-        { binding: 4, resource: { buffer: tile_conics_buffer } },
-        { binding: 6, resource: { buffer: tile_offsets_buffer } },
-        { binding: 7, resource: { buffer: flatten_ids_buffer } },
-        { binding: 8, resource: training_color_view },
-        { binding: 9, resource: training_alpha_view },
-        { binding: 10, resource: { buffer: training_last_ids_buffer } },
-        { binding: 11, resource: { buffer: gaussian_buffer } },
-        { binding: 12, resource: { buffer: sh_buffer } },
-        { binding: 13, resource: { buffer: background_params_buffer! } },
-        { binding: 14, resource: { buffer: tile_mask_buffer! } },
-        { binding: 15, resource: { buffer: tiles_cumsum_buffer } },
-        { binding: 16, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 3, resource: { buffer: gauss_projections_buffer } },
+        { binding: 4, resource: { buffer: tile_offsets_buffer } },
+        { binding: 5, resource: { buffer: flatten_ids_buffer } },
+        { binding: 6, resource: training_color_view },
+        { binding: 7, resource: training_alpha_view },
+        { binding: 8, resource: { buffer: training_last_ids_buffer } },
+        { binding: 9, resource: { buffer: sh_buffer } },
+        { binding: 10, resource: { buffer: background_params_buffer! } },
+        { binding: 11, resource: { buffer: tile_mask_buffer! } },
+        { binding: 12, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 13, resource: { buffer: active_count_uniform_buffer } },
       ],
     });
   }
 
   function rebuildTrainingTiledBackwardBG() {
     if (!training_tiled_backward_pipeline) return;
-    if (!gaussian_buffer || !sh_buffer || !tiling_params_buffer) return;
+    if (!sh_buffer || !tiling_params_buffer) return;
+    if (!gauss_projections_buffer) return;
     if (!residual_color_view || !training_last_ids_buffer) return;
     if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
     if (!grad_sh_buffer || !grad_opacity_buffer || !grad_geom_buffer || !active_count_uniform_buffer) return;
@@ -1280,20 +1303,71 @@ export default function get_renderer(
         { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
         { binding: 1, resource: { buffer: settings_buffer } },
         { binding: 2, resource: { buffer: tiling_params_buffer } },
-        { binding: 3, resource: { buffer: gaussian_buffer } },
-        { binding: 4, resource: { buffer: sh_buffer } },
+        { binding: 3, resource: { buffer: sh_buffer } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer } },
         { binding: 5, resource: residual_color_view },
-        { binding: 16, resource: training_alpha_view },
-        { binding: 6, resource: { buffer: training_last_ids_buffer } },
-        { binding: 7, resource: { buffer: tile_offsets_buffer } },
-        { binding: 8, resource: { buffer: flatten_ids_buffer } },
-        { binding: 9, resource: { buffer: grad_sh_buffer } },
-        { binding: 10, resource: { buffer: grad_opacity_buffer } },
-        { binding: 11, resource: { buffer: active_count_uniform_buffer } },
-        { binding: 12, resource: { buffer: grad_geom_buffer } },
-        { binding: 13, resource: { buffer: background_params_buffer! } },
-        { binding: 14, resource: { buffer: tile_mask_buffer! } },
-        { binding: 15, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 6, resource: training_alpha_view },
+        { binding: 7, resource: { buffer: training_last_ids_buffer } },
+        { binding: 8, resource: { buffer: tile_offsets_buffer } },
+        { binding: 9, resource: { buffer: flatten_ids_buffer } },
+        { binding: 10, resource: { buffer: grad_sh_buffer } },
+        { binding: 11, resource: { buffer: grad_opacity_buffer } },
+        { binding: 12, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 13, resource: { buffer: grad_geom_buffer } },
+        { binding: 14, resource: { buffer: background_params_buffer! } },
+        { binding: 15, resource: { buffer: tile_mask_buffer! } },
+        { binding: 16, resource: { buffer: tiles_cumsum_buffer } },
+      ],
+    });
+  }
+
+  function rebuildBackwardTilesLocalBG() {
+    if (!backward_tiles_local_pipeline) return;
+    if (!sh_buffer || !tiling_params_buffer || !gauss_projections_buffer) return;
+    if (!residual_color_view || !training_alpha_view || !training_last_ids_buffer) return;
+    if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_mask_buffer) return;
+    if (!tiles_cumsum_buffer || !active_count_uniform_buffer || !tile_grads_buffer) return;
+
+    backward_tiles_local_bind_group = device.createBindGroup({
+      label: 'backward tiles local bind group',
+      layout: backward_tiles_local_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: getCurrentTrainingCameraBuffer() } },
+        { binding: 1, resource: { buffer: settings_buffer } },
+        { binding: 2, resource: { buffer: tiling_params_buffer } },
+        { binding: 3, resource: { buffer: sh_buffer } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer } },
+        { binding: 5, resource: residual_color_view },
+        { binding: 6, resource: training_alpha_view },
+        { binding: 7, resource: { buffer: training_last_ids_buffer } },
+        { binding: 8, resource: { buffer: tile_offsets_buffer } },
+        { binding: 9, resource: { buffer: flatten_ids_buffer } },
+        { binding: 10, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 11, resource: { buffer: background_params_buffer! } },
+        { binding: 12, resource: { buffer: tile_mask_buffer! } },
+        { binding: 13, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 14, resource: { buffer: tile_grads_buffer } },
+      ],
+    });
+  }
+
+  function rebuildBackwardReduceBG() {
+    if (!backward_reduce_pipeline) return;
+    if (!tile_grads_buffer || !flatten_ids_buffer || !tiles_cumsum_buffer) return;
+    if (!grad_sh_buffer || !grad_opacity_buffer || !grad_geom_buffer) return;
+    if (!active_count_uniform_buffer) return;
+
+    backward_reduce_bind_group = device.createBindGroup({
+      label: 'backward reduce bind group',
+      layout: backward_reduce_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: tile_grads_buffer } },
+        { binding: 1, resource: { buffer: flatten_ids_buffer } },
+        { binding: 2, resource: { buffer: tiles_cumsum_buffer } },
+        { binding: 3, resource: { buffer: active_count_uniform_buffer } },
+        { binding: 4, resource: { buffer: grad_sh_buffer } },
+        { binding: 5, resource: { buffer: grad_opacity_buffer } },
+        { binding: 6, resource: { buffer: grad_geom_buffer } },
       ],
     });
   }
@@ -1363,8 +1437,7 @@ export default function get_renderer(
   function run_training_tiles_projection(encoder: GPUCommandEncoder) {
     if (!training_tiles_project_pipeline ||
         !gaussian_buffer ||
-        !tile_means2d_buffer || !tile_radii_buffer || !tile_depths_buffer || !tile_conics_buffer ||
-        !tiles_per_gauss_buffer ||
+        !gauss_projections_buffer ||
         !projection_params_buffer ||
         !active_count_uniform_buffer) {
       return;
@@ -1380,12 +1453,8 @@ export default function get_renderer(
         { binding: 1, resource: { buffer: gaussian_buffer } },
         { binding: 2, resource: { buffer: active_count_uniform_buffer } },
         { binding: 3, resource: { buffer: tiling_params_buffer! } },
-        { binding: 4, resource: { buffer: tile_means2d_buffer } },
-        { binding: 5, resource: { buffer: tile_radii_buffer } },
-        { binding: 6, resource: { buffer: tile_depths_buffer } },
-        { binding: 7, resource: { buffer: tiles_per_gauss_buffer } },
-        { binding: 12, resource: { buffer: tile_conics_buffer } },
-        { binding: 13, resource: { buffer: projection_params_buffer } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer } },
+        { binding: 5, resource: { buffer: projection_params_buffer } },
       ],
     });
 
@@ -1404,7 +1473,7 @@ export default function get_renderer(
     // Any call to this function is (re)building tiling data for the current state.
     tilesBuilt = false;
 
-    if (!tiles_per_gauss_buffer) {
+    if (!gauss_projections_buffer) {
       return;
     }
     if (active_count === 0) {
@@ -1415,19 +1484,23 @@ export default function get_renderer(
     const encoder = device.createCommandEncoder();
     run_training_tiles_projection(encoder);
 
-    const tilesSizeBytes = active_count * 4;
+    const projectionsSizeBytes = active_count * GAUSS_PROJECTION_BYTES;
     const staging = device.createBuffer({
-      label: 'tiling tiles_per_gauss staging',
-      size: tilesSizeBytes,
+      label: 'tiling gauss_projections staging',
+      size: projectionsSizeBytes,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
-    encoder.copyBufferToBuffer(tiles_per_gauss_buffer, 0, staging, 0, tilesSizeBytes);
+    encoder.copyBufferToBuffer(gauss_projections_buffer, 0, staging, 0, projectionsSizeBytes);
     device.queue.submit([encoder.finish()]);
 
     await device.queue.onSubmittedWorkDone();
     await staging.mapAsync(GPUMapMode.READ);
     const mapped = staging.getMappedRange();
-    const countsView = new Uint32Array(mapped.slice(0, tilesSizeBytes));
+    const dataView = new DataView(mapped);
+    const countsView = new Uint32Array(active_count);
+    for (let i = 0; i < active_count; i++) {
+      countsView[i] = dataView.getUint32(i * GAUSS_PROJECTION_BYTES + 28, true);
+    }
 
     const cumsum = new Uint32Array(active_count);
     let running = 0;
@@ -1483,7 +1556,7 @@ export default function get_renderer(
     }
 
     if (!training_tiles_emit_pipeline ||
-        !tile_means2d_buffer || !tile_radii_buffer || !tile_depths_buffer ||
+        !gauss_projections_buffer ||
         !tiles_cumsum_buffer ||
         !isect_ids_buffer || !flatten_ids_buffer ||
         !active_count_uniform_buffer) {
@@ -1499,13 +1572,10 @@ export default function get_renderer(
       entries: [
         { binding: 2, resource: { buffer: active_count_uniform_buffer! } },
         { binding: 3, resource: { buffer: tiling_params_buffer! } },
-        { binding: 4, resource: { buffer: tile_means2d_buffer! } },
-        { binding: 5, resource: { buffer: tile_radii_buffer! } },
-        { binding: 6, resource: { buffer: tile_depths_buffer! } },
-        { binding: 7, resource: { buffer: tiles_per_gauss_buffer! } },
-        { binding: 8, resource: { buffer: tiles_cumsum_buffer! } },
-        { binding: 9, resource: { buffer: isect_ids_buffer! } },
-        { binding: 10, resource: { buffer: flatten_ids_buffer! } },
+        { binding: 4, resource: { buffer: gauss_projections_buffer! } },
+        { binding: 6, resource: { buffer: tiles_cumsum_buffer! } },
+        { binding: 7, resource: { buffer: isect_ids_buffer! } },
+        { binding: 8, resource: { buffer: flatten_ids_buffer! } },
       ],
     });
 
@@ -1591,9 +1661,9 @@ export default function get_renderer(
       entries: [
         { binding: 2, resource: { buffer: active_count_uniform_buffer! } },
         { binding: 3, resource: { buffer: tiling_params_buffer! } },
-        { binding: 8, resource: { buffer: tiles_cumsum_buffer! } },
-        { binding: 9, resource: { buffer: isect_ids_buffer! } },
-        { binding: 11, resource: { buffer: tile_offsets_buffer! } },
+        { binding: 6, resource: { buffer: tiles_cumsum_buffer! } },
+        { binding: 7, resource: { buffer: isect_ids_buffer! } },
+        { binding: 9, resource: { buffer: tile_offsets_buffer! } },
       ],
     });
 
@@ -1920,8 +1990,7 @@ export default function get_renderer(
       console.warn('training_tiles_project_pipeline is null, cannot run tiled training forward');
       return;
     }
-    if (!tile_means2d_buffer || !tile_conics_buffer || !tile_depths_buffer ||
-        !tile_offsets_buffer || !flatten_ids_buffer) {
+    if (!gauss_projections_buffer || !tile_offsets_buffer || !flatten_ids_buffer) {
       console.warn('Tiling buffers are not ready, call buildTrainingTiles() before tiled training');
       return;
     }
@@ -1979,22 +2048,64 @@ export default function get_renderer(
       return;
     }
 
-    rebuildTrainingTiledBackwardBG();
-    if (!training_tiled_backward_bind_group) {
-      console.warn('training_tiled_backward_bind_group is null, skipping tiled training_backward dispatch');
+    if (useWavefrontBackward && tile_grads_buffer) {
+      run_wavefront_backward(encoder);
+    } else {
+      rebuildTrainingTiledBackwardBG();
+      if (!training_tiled_backward_bind_group) {
+        console.warn('training_tiled_backward_bind_group is null, skipping tiled training_backward dispatch');
+        return;
+      }
+
+      const wgSizeX = 8;
+      const wgSizeY = 8;
+      const numGroupsX = Math.ceil(canvas.width / wgSizeX);
+      const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+
+      const pass = encoder.beginComputePass({ label: 'training tiled backward' });
+      pass.setPipeline(training_tiled_backward_pipeline);
+      pass.setBindGroup(0, training_tiled_backward_bind_group);
+      pass.dispatchWorkgroups(numGroupsX, numGroupsY);
+      pass.end();
+    }
+  }
+
+  function run_wavefront_backward(encoder: GPUCommandEncoder) {
+    rebuildBackwardTilesLocalBG();
+    if (!backward_tiles_local_bind_group) {
+      console.warn('backward_tiles_local_bind_group is null, falling back to old backward');
+      useWavefrontBackward = false;
+      run_training_tiled_backward(encoder);
       return;
     }
 
-    const wgSizeX = 8;
-    const wgSizeY = 8;
-    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
-    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+    const tilesX = Math.ceil(canvas.width / TILE_SIZE);
+    const tilesY = Math.ceil(canvas.height / TILE_SIZE);
 
-    const pass = encoder.beginComputePass({ label: 'training tiled backward' });
-    pass.setPipeline(training_tiled_backward_pipeline);
-    pass.setBindGroup(0, training_tiled_backward_bind_group);
-    pass.dispatchWorkgroups(numGroupsX, numGroupsY);
-    pass.end();
+    const pass1 = encoder.beginComputePass({ label: 'backward tiles local (phase 1)' });
+    pass1.setPipeline(backward_tiles_local_pipeline!);
+    pass1.setBindGroup(0, backward_tiles_local_bind_group);
+    pass1.dispatchWorkgroups(tilesX, tilesY);
+    pass1.end();
+
+    rebuildBackwardReduceBG();
+    if (!backward_reduce_bind_group) {
+      console.warn('backward_reduce_bind_group is null');
+      return;
+    }
+
+    const n_isects = lastTileCoverageStats?.totalIntersections ?? 0;
+    if (n_isects === 0) {
+      return;
+    }
+
+    const numReduceGroups = Math.ceil(n_isects / 256);
+
+    const pass2 = encoder.beginComputePass({ label: 'backward reduce (phase 2)' });
+    pass2.setPipeline(backward_reduce_pipeline!);
+    pass2.setBindGroup(0, backward_reduce_bind_group);
+    pass2.dispatchWorkgroups(numReduceGroups);
+    pass2.end();
   }
 
   function run_training_backward_geom(encoder: GPUCommandEncoder) {
@@ -2901,8 +3012,8 @@ export default function get_renderer(
     backgroundUsed: [number, number, number];
     observation: string;
   } | null> {
-    if (!tile_offsets_buffer || !flatten_ids_buffer || !tile_means2d_buffer || 
-        !tile_conics_buffer || !tile_depths_buffer || !gaussian_buffer || !lastTileCoverageStats) {
+    if (!tile_offsets_buffer || !flatten_ids_buffer || !gauss_projections_buffer || 
+        !gaussian_buffer || !lastTileCoverageStats) {
       console.warn('[tracePixelCompositing] Required buffers not available');
       return null;
     }
@@ -2958,14 +3069,22 @@ export default function get_renderer(
     const flattenData = await readBuffer(flatten_ids_buffer, lastTileCoverageStats.totalIntersections * 4, 'flatten_ids');
     const flattenIds = new Uint32Array(flattenData);
 
-    const means2dData = await readBuffer(tile_means2d_buffer, active_count * 8, 'means2d');
-    const means2d = new Float32Array(means2dData);
+    // Read merged GaussProjection buffer and extract components
+    const projData = await readBuffer(gauss_projections_buffer, active_count * GAUSS_PROJECTION_BYTES, 'gauss_projections');
+    const projView = new DataView(projData);
     
-    const conicsData = await readBuffer(tile_conics_buffer, active_count * 12, 'conics');
-    const conics = new Float32Array(conicsData);
-    
-    const depthsData = await readBuffer(tile_depths_buffer, active_count * 4, 'depths');
-    const depths = new Float32Array(depthsData);
+    const means2d = new Float32Array(active_count * 2);
+    const conics = new Float32Array(active_count * 3);
+    const depths = new Float32Array(active_count);
+    for (let i = 0; i < active_count; i++) {
+      const base = i * GAUSS_PROJECTION_BYTES;
+      means2d[i * 2 + 0] = projView.getFloat32(base + 0, true);
+      means2d[i * 2 + 1] = projView.getFloat32(base + 4, true);
+      depths[i] = projView.getFloat32(base + 12, true);
+      conics[i * 3 + 0] = projView.getFloat32(base + 16, true);
+      conics[i * 3 + 1] = projView.getFloat32(base + 20, true);
+      conics[i * 3 + 2] = projView.getFloat32(base + 24, true);
+    }
 
     const gaussianData = await readBuffer(gaussian_buffer, active_count * C_SIZE_3D_GAUSSIAN, 'gaussians');
     const gaussians = new Uint16Array(gaussianData);
@@ -3704,7 +3823,7 @@ export default function get_renderer(
 
     updateShDegreeSchedule();
 
-    // Forward -> Loss -> Backward -> Adam (tiled path is now canonical)
+    // Forward -> Loss -> Backward -> Adam
     run_training_tiled_forward(encoder);
     run_training_loss(encoder);
     run_training_tiled_backward(encoder);
@@ -3712,6 +3831,85 @@ export default function get_renderer(
     run_adam_updates(encoder);
     rebuildTrainingApplyParamsBG();
     run_training_apply_params(encoder);
+
+    camera.needsPreprocess = true;
+  }
+
+  async function profiledTrainStep(): Promise<void> {
+    if (training_camera_buffers.length > 0) {
+      current_training_camera_index = trainingIteration % training_camera_buffers.length;
+    }
+
+    const stats = lastTileCoverageStats;
+    profiler.setStats(
+      active_count,
+      stats ? stats.totalTiles : 0,
+      stats ? stats.totalIntersections : 0
+    );
+
+    await profiler.startIteration(trainingIteration);
+    trainingIteration++;
+
+    await profiler.startPass('zeroGradBuffers');
+    {
+      const encoder = device.createCommandEncoder();
+      zeroGradBuffers();
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('zeroGradBuffers');
+
+    updateShDegreeSchedule();
+
+    await profiler.startPass('forward');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_tiled_forward(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('forward');
+
+    await profiler.startPass('loss');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_loss(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('loss');
+
+    await profiler.startPass('backward_tiles');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_tiled_backward(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('backward_tiles');
+
+    await profiler.startPass('backward_geom');
+    {
+      const encoder = device.createCommandEncoder();
+      run_training_backward_geom(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('backward_geom');
+
+    await profiler.startPass('adam');
+    {
+      const encoder = device.createCommandEncoder();
+      run_adam_updates(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('adam');
+
+    await profiler.startPass('apply_params');
+    {
+      const encoder = device.createCommandEncoder();
+      rebuildTrainingApplyParamsBG();
+      run_training_apply_params(encoder);
+      device.queue.submit([encoder.finish()]);
+    }
+    await profiler.endPass('apply_params');
+
+    await profiler.endIteration();
 
     camera.needsPreprocess = true;
   }
@@ -3880,5 +4078,8 @@ export default function get_renderer(
     debugTracePixel,
     getTileCoverageStats,
     buildTrainingTiles: buildTileIntersections,
+    enableProfiling: (enabled: boolean) => profiler.setEnabled(enabled),
+    printProfilingReport: () => profiler.printReport(),
+    profiledTrainStep,
   };
 }
