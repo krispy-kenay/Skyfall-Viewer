@@ -1,11 +1,8 @@
 import { PointCloud } from '../utils/load';
-import { C_SIZE_3D_GAUSSIAN } from '../utils/pointcloud-loader';
 import preprocessWGSL from '../shaders/preprocess.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import commonWGSL from '../shaders/common.wgsl';
 import knnInitWGSL from '../shaders/knn-init.wgsl';
-import pruneWGSL from '../shaders/prune.wgsl';
-import densifyWGSL from '../shaders/densify.wgsl';
 import trainingForwardTilesWGSL from '../shaders/training-forward-tiles.wgsl';
 import trainingLossWGSL from '../shaders/training-loss.wgsl';
 import trainingBackwardTilesWGSL from '../shaders/training-backward-tiles.wgsl';
@@ -15,33 +12,47 @@ import trainingBackwardGeomWGSL from '../shaders/training-backward-geom.wgsl';
 import trainingTilesWGSL from '../shaders/training-tiles.wgsl';
 import trainingParamsWGSL from '../shaders/training-params.wgsl';
 import adamWGSL from '../shaders/adam.wgsl';
+import metricWGSL from '../shaders/metric-map.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
 import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
 import { TrainingProfiler, setGlobalProfiler } from '../utils/training-profiler';
+import { TrainingController, PruneParams, DEFAULT_TRAINING_SCHEDULE } from '../utils/training-controller';
+import { DensificationManager, GRAD_ACCUM_STRIDE, GRAD_ACCUM_X, GRAD_ACCUM_ABS, GRAD_ACCUM_DENOM } from '../utils/densification';
+import { ImportanceManager } from '../utils/importance';
+import densifyAccumWGSL from '../shaders/densify-accum.wgsl';
+import densifyDecideWGSL from '../shaders/densify-decide.wgsl';
+import importanceAccumWGSL from '../shaders/importance-accum.wgsl';
+import pruneDecideWGSL from '../shaders/prune-decide.wgsl';
 
 export interface GaussianRenderer extends Renderer {
   setGaussianScale(value: number): void;
   resizeViewport(w: number, h: number): void;
   train(numFrames: number): Promise<void>;
-  debugTrainOnce?(label?: string): Promise<void>;
-  debugDumpProjection?(label?: string): Promise<void>;
-  debugTrainWithDiagnostics?(): Promise<void>;
-  collectGradientDiagnostics?(): Promise<any>;
-  tracePixelCompositing?(pixelX: number, pixelY: number): Promise<any>;
-  debugTracePixel?(pixelX: number, pixelY: number): Promise<void>;
-  getTileCoverageStats?(): any;
+  stopTraining(): void;
   setTargetTexture(view: GPUTextureView, sampler: GPUSampler): void;
   initializeKnn(encoder: GPUCommandEncoder): void;
   initializeKnnAndSync(): Promise<void>;
-  prune(): Promise<number>;
-  densify(): Promise<number>;
+  prune(customParams?: PruneParams): Promise<number>;
+  resetOpacity(maxOpacity?: number): Promise<void>;
   setTrainingCameras(cameras: TrainingCameraData[]): void;
   setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>): void;
   buildTrainingTiles(): Promise<void>;
   enableProfiling?(enabled: boolean): void;
   printProfilingReport?(): void;
   profiledTrainStep?(): Promise<void>;
+  getTrainingController?(): TrainingController | null;
+  getSceneExtent?(): number;
+  // Training parameter controls
+  getTrainingParams(): TrainingParams;
+  setTrainingParams(params: Partial<TrainingParams>): void;
+  getTrainingStatus(): TrainingStatus;
+  getGaussianCount(): number;
+  // Loss weight controls
+  getLossWeights(): LossWeights;
+  setLossWeights(weights: Partial<LossWeights>): void;
+  // Diagnostics
+  dumpTrainingDiagnostics(): Promise<void>;
 }
 
 // ===============================================
@@ -53,16 +64,57 @@ const BYTES_PER_SH = 96;
 const WORKGROUP_SIZE = 256;
 const PRUNE_INTERVAL = 70;
 const DENSIFY_INTERVAL = 100;
+const MULTI_VIEW_SAMPLE_COUNT = 10;
+const MULTI_VIEW_LOSS_THRESH = 0.1;
+const MULTI_VIEW_IMPORTANCE_THRESHOLD = 5;
 
 // Training hyperparameters
-const SH_DEGREE_INTERVAL = 100;
+const SH_DEGREE_INTERVAL = 1000;
 
-// Learning rates
-const MEANS_LR = 0.0;
-const SHS_LR = 2e-1;
-const OPACITY_LR = 2e-1;
-const SCALING_LR = 1e1;
-const ROTATION_LR = 5e-3;
+// SH (color) update frequency - only update every N iterations
+// FastGS updates SH every 16 iterations for first 15k iters, then less
+let SH_UPDATE_INTERVAL = 16;
+
+// Learning rates (mutable for runtime adjustment)
+// Based on FastGS defaults, scaled up ~2-3x for faster convergence in 10k iterations
+// FastGS: position=0.00016, feature=0.0025, opacity=0.025, scale=0.005, rotation=0.001
+let MEANS_LR = 0.00016;    // Position
+let SHS_LR = 0.0025;       // SH/color
+let OPACITY_LR = 0.025;    // Opacity
+let SCALING_LR = 0.005;    // Scale
+let ROTATION_LR = 0.001;   // Rotation
+
+// Training hyperparameters interface
+export interface TrainingParams {
+  lr_means: number;
+  lr_sh: number;
+  lr_opacity: number;
+  lr_scale: number;
+  lr_rotation: number;
+  sh_update_interval: number;  // Only update SH every N iterations
+}
+
+// Loss weight interface
+export interface LossWeights {
+  w_l2: number;
+  w_l1: number;
+  w_ssim: number;
+}
+
+// Training status interface
+export interface TrainingStatus {
+  isTraining: boolean;
+  currentIteration: number;
+  targetIterations: number;
+  iterationsPerSecond: number;
+  gaussianCount: number;
+}
+
+interface MultiViewScores {
+  importance: Uint32Array;
+  pruning: Float32Array;
+  sampleCount: number;
+}
 
 // Training parameter layout
 const FLOAT32_BYTES = 4;
@@ -111,16 +163,9 @@ export default function get_renderer(
   let density_buffer: GPUBuffer | null = null;
   let gaussian_buffer: GPUBuffer | null = null;
   let sh_buffer: GPUBuffer | null = null;
-  let gaussian_buffer_temp: GPUBuffer | null = null;
-  let sh_buffer_temp: GPUBuffer | null = null;
-  let density_buffer_temp: GPUBuffer | null = null;
   let active_count_buffer: GPUBuffer | null = null;
   let active_count_uniform_buffer: GPUBuffer | null = null;
   let knn_num_points_buffer: GPUBuffer | null = null;
-  let prune_threshold_buffer: GPUBuffer | null = null;
-  let prune_input_count_buffer: GPUBuffer | null = null;
-  let densify_split_threshold_buffer: GPUBuffer | null = null;
-  let densify_clone_threshold_buffer: GPUBuffer | null = null;
 
   // Training forward render targets
   let training_color_texture: GPUTexture | null = null;
@@ -179,11 +224,9 @@ export default function get_renderer(
   let render_splat_bg: GPUBindGroup | null = null;
   let preprocess_bg: GPUBindGroup | null = null;
   let knn_init_bind_group: GPUBindGroup | null = null;
-  let prune_bind_group: GPUBindGroup | null = null;
-  let densify_bind_group: GPUBindGroup | null = null;
-
-  // Debug: projection inspection from preprocess.wgsl
-  let debug_projection_buffer: GPUBuffer | null = null;
+  let metric_map_bind_group: GPUBindGroup | null = null;
+  let metric_threshold_bind_group: GPUBindGroup | null = null;
+  let metric_accum_bind_group: GPUBindGroup | null = null;
 
   // External resources
   let targetTextureView: GPUTextureView | null = null;
@@ -196,7 +239,7 @@ export default function get_renderer(
   let training_cameras: TrainingCameraData[] = [];
   let training_camera_buffers: GPUBuffer[] = [];
   let current_training_camera_index = 0;
-  
+
   // Training images
   let training_images: Array<{ view: GPUTextureView; sampler: GPUSampler }> = [];
 
@@ -230,6 +273,7 @@ export default function get_renderer(
   // Tracking for training tiling state
   let tilesBuilt = false;
   let tilesBuiltForCameraIndex = -1;
+  let renderingSuspended = false;
 
   let lastTileCoverageStats: {
     numFrustumPass: number;
@@ -244,15 +288,40 @@ export default function get_renderer(
 
   // Async training loop state
   let isTraining = false;
+  let stopTrainingRequested = false;
+  let trainingTargetIterations = 0;
+  let trainingStartTime = 0;
+  let trainingIterationsCompleted = 0;
 
   // Performance profiler
   const profiler = new TrainingProfiler(device);
   setGlobalProfiler(profiler);
 
+  // Training controller for pruning/densification schedule
+  let trainingController: TrainingController | null = null;
+  let sceneExtent: number = 1.0;  // Will be set when loading point cloud
+
+  // Densification / importance managers and pipelines
+  let densificationManager: DensificationManager | null = null;
+  let importanceManager: ImportanceManager | null = null;
+  let densifyAccumPipeline: GPUComputePipeline | null = null;
+  let densifyDecidePipeline: GPUComputePipeline | null = null;
+  let densifyAccumBindGroup: GPUBindGroup | null = null;
+  let densifyDecideBindGroup: GPUBindGroup | null = null;
+  let densifyParamsBuffer: GPUBuffer | null = null;
+  let importanceAccumPipeline: GPUComputePipeline | null = null;
+  let importanceAccumBindGroup: GPUBindGroup | null = null;
+  let importanceAccumParamsBuffer: GPUBuffer | null = null;
+  let pruneDecidePipeline: GPUComputePipeline | null = null;
+  let pruneDecideBindGroup: GPUBindGroup | null = null;
+  let pruneDecideParamsBuffer: GPUBuffer | null = null;
+  let cachedMultiViewScores: MultiViewScores | null = null;
+  let cachedMultiViewIteration = -1;
+
   function getCurrentTrainingCameraBuffer(): GPUBuffer {
     if (training_camera_buffers.length > 0 &&
-        current_training_camera_index >= 0 &&
-        current_training_camera_index < training_camera_buffers.length) {
+      current_training_camera_index >= 0 &&
+      current_training_camera_index < training_camera_buffers.length) {
       return training_camera_buffers[current_training_camera_index];
     }
     return camera_buffer;
@@ -263,6 +332,12 @@ export default function get_renderer(
   let background_params_buffer: GPUBuffer | null = null;
   let tile_mask_buffer: GPUBuffer | null = null;
   let loss_params_buffer: GPUBuffer | null = null;
+let metric_image_params_buffer: GPUBuffer | null = null;
+let metric_threshold_params_buffer: GPUBuffer | null = null;
+let metric_pixel_buffer: GPUBuffer | null = null;
+let metric_flag_buffer: GPUBuffer | null = null;
+let metric_counts_buffer: GPUBuffer | null = null;
+let metric_accum_params_buffer: GPUBuffer | null = null;
 
   // ===============================================
   // Buffer Creation Functions
@@ -310,10 +385,13 @@ export default function get_renderer(
   }
 
   function createLossParamsBuffer(): GPUBuffer {
+    // Loss weights: [w_l2, w_l1, w_ssim, _pad]
+    // Original 3DGS uses: L = 0.8 * L1 + 0.2 * D-SSIM
+    // We'll use L1-heavy mix to avoid blur: w_l2=0.2, w_l1=0.8
     const data = new Float32Array([
-      1.0,
-      0.0,
-      0.0,
+      0.0,  // w_l2 - FastGS uses SSIM instead
+      0.8,  // w_l1
+      0.2,  // w_ssim - FastGS default
       0.0,
     ]);
     return createBuffer(
@@ -383,45 +461,6 @@ export default function get_renderer(
     };
   }
 
-  function createPruneThresholdBuffer(): GPUBuffer {
-    return createBuffer(
-      device,
-      'prune threshold',
-      4,
-      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      new Float32Array([0.01])
-    );
-  }
-
-  function createPruneInputCountBuffer(): GPUBuffer {
-    return createBuffer(
-      device,
-      'prune input count',
-      4,
-      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-      new Uint32Array([0])
-    );
-  }
-
-  function createDensifyThresholdBuffers(): { split: GPUBuffer; clone: GPUBuffer } {
-    return {
-      split: createBuffer(
-        device,
-        'split threshold',
-        4,
-        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        new Float32Array([1.6])
-      ),
-      clone: createBuffer(
-        device,
-        'clone threshold',
-        4,
-        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        new Float32Array([0.1])
-      )
-    };
-  }
-
   function createKnnNumPointsBuffer(): GPUBuffer {
     return createBuffer(
       device,
@@ -445,16 +484,6 @@ export default function get_renderer(
     density_buffer = createDensityBuffer(newCapacity);
     gaussian_buffer = createGaussianBuffer(newCapacity);
     sh_buffer = createSHBuffer(newCapacity);
-    gaussian_buffer_temp = createGaussianBuffer(newCapacity);
-    sh_buffer_temp = createSHBuffer(newCapacity);
-    density_buffer_temp = createDensityBuffer(newCapacity);
-
-    const DEBUG_PROJ_STRIDE_BYTES = 2 * 4 * FLOAT32_BYTES;
-    debug_projection_buffer = device.createBuffer({
-      label: 'debug projection (pos_cam + clip)',
-      size: newCapacity * DEBUG_PROJ_STRIDE_BYTES,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
 
     // create float32 training parameter buffers
     train_position_buffer = device.createBuffer({
@@ -525,6 +554,8 @@ export default function get_renderer(
     isect_ids_buffer = null;
     flatten_ids_buffer = null;
     tile_offsets_buffer = null;
+    tilesBuilt = false;
+    tilesBuiltForCameraIndex = -1;
 
     // Adam moment buffers
     moment_sh_m1_buffer = device.createBuffer({
@@ -643,38 +674,9 @@ export default function get_renderer(
     tilesBuilt = false;
   }
 
-  function setPruneThreshold(value: number) {
-    if (!prune_threshold_buffer) {
-      prune_threshold_buffer = createPruneThresholdBuffer();
-      rebuildPruneBG();
-    }
-    device.queue.writeBuffer(prune_threshold_buffer, 0, new Float32Array([value]));
-  }
-
-  function setDensifySplitThreshold(value: number) {
-    if (!densify_split_threshold_buffer) {
-      const buffers = createDensifyThresholdBuffers();
-      densify_split_threshold_buffer = buffers.split;
-      densify_clone_threshold_buffer = buffers.clone;
-      rebuildDensifyBG();
-    }
-    device.queue.writeBuffer(densify_split_threshold_buffer, 0, new Float32Array([value]));
-  }
-
-  function setDensifyCloneThreshold(value: number) {
-    if (!densify_clone_threshold_buffer) {
-      const buffers = createDensifyThresholdBuffers();
-      densify_split_threshold_buffer = buffers.split;
-      densify_clone_threshold_buffer = buffers.clone;
-      rebuildDensifyBG();
-    }
-    device.queue.writeBuffer(densify_clone_threshold_buffer, 0, new Float32Array([value]));
-  }
-
   function setTargetTexture(view: GPUTextureView, sampler: GPUSampler) {
     targetTextureView = view;
     targetSampler = sampler;
-    rebuildDensifyBG();
   }
 
   // ===============================================
@@ -702,24 +704,6 @@ export default function get_renderer(
     },
   });
 
-  const prune_pipeline = device.createComputePipeline({
-    label: 'prune',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: commonWGSL + '\n' + pruneWGSL }),
-      entryPoint: 'prune',
-    },
-  });
-
-  const densify_pipeline = device.createComputePipeline({
-    label: 'densify',
-    layout: 'auto',
-    compute: {
-      module: device.createShaderModule({ code: commonWGSL + '\n' + densifyWGSL }),
-      entryPoint: 'densify',
-    },
-  });
-
   const render_shader = device.createShaderModule({ code: commonWGSL + '\n' + renderWGSL });
 
   const render_pipeline = device.createRenderPipeline({
@@ -732,8 +716,8 @@ export default function get_renderer(
       targets: [{
         format: presentation_format,
         blend: {
-          color : { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-          alpha : { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
         },
         writeMask: GPUColorWrite.ALL
       }],
@@ -821,6 +805,35 @@ export default function get_renderer(
     },
   });
 
+  const metric_module = device.createShaderModule({ code: commonWGSL + '\n' + metricWGSL });
+
+  const metric_map_pipeline = device.createComputePipeline({
+    label: 'metric map',
+    layout: 'auto',
+    compute: {
+      module: metric_module,
+      entryPoint: 'compute_metric_map',
+    },
+  });
+
+  const metric_threshold_pipeline = device.createComputePipeline({
+    label: 'metric threshold',
+    layout: 'auto',
+    compute: {
+      module: metric_module,
+      entryPoint: 'threshold_metric_map',
+    },
+  });
+
+  const metric_accum_pipeline = device.createComputePipeline({
+    label: 'metric accumulate',
+    layout: 'auto',
+    compute: {
+      module: metric_module,
+      entryPoint: 'accumulate_metric_counts',
+    },
+  });
+
   const training_tiled_forward_pipeline = device.createComputePipeline({
     label: 'training tiled forward',
     layout: 'auto',
@@ -857,6 +870,58 @@ export default function get_renderer(
     },
   });
 
+  // Densification pipelines
+  densifyAccumPipeline = device.createComputePipeline({
+    label: 'densify gradient accumulation',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: densifyAccumWGSL }),
+      entryPoint: 'accumulate_grads',
+    },
+  });
+  importanceAccumPipeline = device.createComputePipeline({
+    label: 'importance accumulation',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + importanceAccumWGSL }),
+      entryPoint: 'accumulate_importance',
+    },
+  });
+
+  densifyDecidePipeline = device.createComputePipeline({
+    label: 'densify decision',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: densifyDecideWGSL }),
+      entryPoint: 'densify_decide',
+    },
+  });
+  pruneDecidePipeline = device.createComputePipeline({
+    label: 'prune decision',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: pruneDecideWGSL }),
+      entryPoint: 'prune_decide',
+    },
+  });
+
+  // Densification params buffer
+  densifyParamsBuffer = device.createBuffer({
+    label: 'densify params',
+    size: 32,  // 8 floats
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  importanceAccumParamsBuffer = device.createBuffer({
+    label: 'importance accum params',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  pruneDecideParamsBuffer = device.createBuffer({
+    label: 'prune decide params',
+    size: 32,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
   // ===============================================
   // Bind Group Creation Functions
   // ===============================================
@@ -877,8 +942,8 @@ export default function get_renderer(
 
   function ensureTrainingRenderTargets(width: number, height: number) {
     if (training_color_texture && training_alpha_texture &&
-        residual_color_texture && residual_alpha_texture &&
-        training_width === width && training_height === height) {
+      residual_color_texture && residual_alpha_texture &&
+      training_width === width && training_height === height) {
       return;
     }
 
@@ -931,6 +996,43 @@ export default function get_renderer(
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
     }
+
+    const pixelByteSize = pixelCount * FLOAT32_BYTES;
+    if (!metric_pixel_buffer || metric_pixel_buffer.size < pixelByteSize) {
+      metric_pixel_buffer?.destroy();
+      metric_pixel_buffer = device.createBuffer({
+        label: 'metric pixel loss',
+        size: pixelByteSize,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    if (!metric_flag_buffer || metric_flag_buffer.size < pixelCount * 4) {
+      metric_flag_buffer?.destroy();
+      metric_flag_buffer = device.createBuffer({
+        label: 'metric pixel flags',
+        size: pixelCount * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
+
+    if (!metric_image_params_buffer) {
+      metric_image_params_buffer = device.createBuffer({
+        label: 'metric image params',
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    const imageParams = new Uint32Array([width, height, pixelCount, 0]);
+    device.queue.writeBuffer(metric_image_params_buffer, 0, imageParams);
+
+    if (!metric_threshold_params_buffer) {
+      metric_threshold_params_buffer = device.createBuffer({
+        label: 'metric threshold params',
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
   }
 
   function rebuildSorterBG() {
@@ -975,7 +1077,6 @@ export default function get_renderer(
 
   function rebuildPreprocessBG() {
     if (!gaussian_buffer || !sh_buffer || !splat_buffer) return;
-    if (!debug_projection_buffer) return;
     preprocess_bg = device.createBindGroup({
       label: 'preprocess g1',
       layout: preprocess_pipeline.getBindGroupLayout(1),
@@ -983,7 +1084,6 @@ export default function get_renderer(
         { binding: 0, resource: { buffer: gaussian_buffer } },
         { binding: 1, resource: { buffer: sh_buffer } },
         { binding: 2, resource: { buffer: splat_buffer } },
-        { binding: 3, resource: { buffer: debug_projection_buffer } },
       ],
     });
   }
@@ -1024,22 +1124,13 @@ export default function get_renderer(
   }
 
   function ensureIntersectionBuffers(requiredIntersections: number) {
-    if (requiredIntersections <= 0) {
-      num_intersections = 0;
-      if (isect_ids_buffer) {
-        isect_ids_buffer.destroy();
-        isect_ids_buffer = null;
-      }
-      if (flatten_ids_buffer) {
-        flatten_ids_buffer.destroy();
-        flatten_ids_buffer = null;
-      }
-      if (tile_offsets_buffer) {
-        tile_offsets_buffer.destroy();
-        tile_offsets_buffer = null;
-      }
-      return;
-    }
+    // CRITICAL FIX: Do NOT destroy buffers if requiredIntersections is 0.
+    // The training loop expects these buffers to exist (be non-null) even if empty.
+    // If we destroy them, subsequent bind group updates will fail.
+
+    // We'll treat 0 intersections as a valid state that just needs minimal buffer sizes.
+    // Just ensure non-negative.
+    requiredIntersections = Math.max(0, requiredIntersections);
 
     const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
     const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
@@ -1047,13 +1138,16 @@ export default function get_renderer(
     const numCameras = 1;
     const totalTiles = tileCount * numCameras;
 
+    // Ensure buffers are never null. Use a minimum size of 4 bytes (1 u32) 
+    // to satisfy WebGPU requirements if requiredIntersections is 0.
+
     if (!isect_ids_buffer || requiredIntersections > num_intersections) {
       if (isect_ids_buffer) {
         isect_ids_buffer.destroy();
       }
       isect_ids_buffer = device.createBuffer({
         label: 'tiling isect_ids (u32 keys)',
-        size: requiredIntersections * 4,
+        size: Math.max(requiredIntersections * 4, 4), // Min 4 bytes
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
     }
@@ -1064,7 +1158,7 @@ export default function get_renderer(
       }
       flatten_ids_buffer = device.createBuffer({
         label: 'tiling flatten_ids (u32)',
-        size: requiredIntersections * 4,
+        size: Math.max(requiredIntersections * 4, 4), // Min 4 bytes
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
     }
@@ -1126,70 +1220,44 @@ export default function get_renderer(
     });
   }
 
-  function rebuildPruneBG() {
-    if (!gaussian_buffer || !sh_buffer || !density_buffer || !active_count_buffer ||
-        !gaussian_buffer_temp || !sh_buffer_temp || !density_buffer_temp) {
-      return;
-    }
-    if (!prune_threshold_buffer) {
-      prune_threshold_buffer = createPruneThresholdBuffer();
-    }
-    if (!prune_input_count_buffer) {
-      prune_input_count_buffer = createPruneInputCountBuffer();
-    }
-    prune_bind_group = device.createBindGroup({
-      label: 'prune bind group',
-      layout: prune_pipeline.getBindGroupLayout(0),
+  function rebuildImportanceAccumBindGroup(): void {
+    if (!importanceAccumPipeline || !gauss_projections_buffer || !importanceManager || !importanceAccumParamsBuffer) return;
+    const statsBuffer = importanceManager.getStatsBuffer();
+    if (!statsBuffer) return;
+    importanceAccumBindGroup = device.createBindGroup({
+      label: 'importance accum bind group',
+      layout: importanceAccumPipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: gaussian_buffer } },
-        { binding: 1, resource: { buffer: sh_buffer } },
-        { binding: 2, resource: { buffer: density_buffer } },
-        { binding: 3, resource: { buffer: gaussian_buffer_temp } },
-        { binding: 4, resource: { buffer: sh_buffer_temp } },
-        { binding: 5, resource: { buffer: density_buffer_temp } },
-        { binding: 6, resource: { buffer: active_count_buffer } },
-        { binding: 7, resource: { buffer: prune_threshold_buffer } },
-        { binding: 8, resource: { buffer: prune_input_count_buffer } },
-      ]
+        { binding: 0, resource: { buffer: gauss_projections_buffer } },
+        { binding: 1, resource: { buffer: statsBuffer } },
+        { binding: 2, resource: { buffer: importanceAccumParamsBuffer } },
+      ],
     });
   }
 
-  function rebuildDensifyBG() {
-    if (!gaussian_buffer || !sh_buffer || !density_buffer || !active_count_buffer ||
-        !active_count_uniform_buffer || !targetTextureView || !targetSampler ||
-        !gaussian_buffer_temp || !sh_buffer_temp || !density_buffer_temp) {
-      return;
-    }
-    if (!densify_split_threshold_buffer || !densify_clone_threshold_buffer) {
-      const buffers = createDensifyThresholdBuffers();
-      densify_split_threshold_buffer = buffers.split;
-      densify_clone_threshold_buffer = buffers.clone;
-    }
-    densify_bind_group = device.createBindGroup({
-      label: 'densify bind group',
-      layout: densify_pipeline.getBindGroupLayout(0),
+  function rebuildPruneDecideBindGroup(): void {
+    if (!pruneDecidePipeline || !importanceManager || !train_opacity_buffer || !train_scale_buffer || !pruneDecideParamsBuffer) return;
+    const statsBuffer = importanceManager.getStatsBuffer();
+    const actionsBuffer = importanceManager.getPruneActionsBuffer();
+    const countsBuffer = importanceManager.getPruneCountBuffer();
+    if (!statsBuffer || !actionsBuffer || !countsBuffer) return;
+    pruneDecideBindGroup = device.createBindGroup({
+      label: 'prune decide bind group',
+      layout: pruneDecidePipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: gaussian_buffer } },
-        { binding: 1, resource: { buffer: sh_buffer } },
-        { binding: 2, resource: { buffer: density_buffer } },
-        { binding: 3, resource: { buffer: gaussian_buffer_temp } },
-        { binding: 4, resource: { buffer: sh_buffer_temp } },
-        { binding: 5, resource: { buffer: density_buffer_temp } },
-        { binding: 6, resource: { buffer: active_count_buffer } },
-        { binding: 7, resource: { buffer: active_count_uniform_buffer } },
-        { binding: 8, resource: { buffer: densify_split_threshold_buffer } },
-        { binding: 9, resource: { buffer: densify_clone_threshold_buffer } },
-        { binding: 10, resource: { buffer: camera_buffer } },
-        { binding: 11, resource: { buffer: settings_buffer } },
-        { binding: 12, resource: targetSampler },
-        { binding: 13, resource: targetTextureView },
-      ]
+        { binding: 0, resource: { buffer: statsBuffer } },
+        { binding: 1, resource: { buffer: train_opacity_buffer } },
+        { binding: 2, resource: { buffer: train_scale_buffer } },
+        { binding: 3, resource: { buffer: actionsBuffer } },
+        { binding: 4, resource: { buffer: countsBuffer } },
+        { binding: 5, resource: { buffer: pruneDecideParamsBuffer } },
+      ],
     });
   }
 
   function rebuildTrainingLossBG() {
     if (!training_color_view || !training_alpha_view ||
-        !residual_color_view || !residual_alpha_view) {
+      !residual_color_view || !residual_alpha_view) {
       return;
     }
 
@@ -1227,17 +1295,17 @@ export default function get_renderer(
 
   function rebuildTrainingBackwardBG() {
     if (!gaussian_buffer || !grad_sh_buffer || !grad_opacity_buffer ||
-        !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer ||
-        !residual_color_view ||
-        !active_count_uniform_buffer) {
+      !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer ||
+      !residual_color_view ||
+      !active_count_uniform_buffer) {
       return;
     }
   }
 
   function rebuildTrainingBackwardGeomBG() {
     if (!gaussian_buffer ||
-        !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer ||
-        !grad_geom_buffer || !active_count_uniform_buffer) {
+      !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer ||
+      !grad_geom_buffer || !active_count_uniform_buffer) {
       return;
     }
 
@@ -1374,9 +1442,9 @@ export default function get_renderer(
 
   function rebuildTrainingInitParamsBG() {
     if (!gaussian_buffer || !sh_buffer ||
-        !train_opacity_buffer || !train_sh_buffer ||
-        !train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
-        !active_count_uniform_buffer) {
+      !train_opacity_buffer || !train_sh_buffer ||
+      !train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+      !active_count_uniform_buffer) {
       return;
     }
 
@@ -1398,9 +1466,9 @@ export default function get_renderer(
 
   function rebuildTrainingApplyParamsBG() {
     if (!gaussian_buffer || !sh_buffer ||
-        !train_opacity_buffer || !train_sh_buffer ||
-        !train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
-        !active_count_uniform_buffer) {
+      !train_opacity_buffer || !train_sh_buffer ||
+      !train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+      !active_count_uniform_buffer) {
       return;
     }
 
@@ -1420,26 +1488,119 @@ export default function get_renderer(
     });
   }
 
+  function rebuildMetricMapBindGroup() {
+    if (!metric_map_pipeline || !training_color_view || !metric_pixel_buffer || !metric_image_params_buffer) {
+      return;
+    }
+    let targetView: GPUTextureView | null = null;
+    let targetSamplerToUse: GPUSampler | null = null;
+    if (training_images.length > 0 && current_training_camera_index < training_images.length) {
+      targetView = training_images[current_training_camera_index].view;
+      targetSamplerToUse = training_images[current_training_camera_index].sampler;
+    } else if (targetTextureView && targetSampler) {
+      targetView = targetTextureView;
+      targetSamplerToUse = targetSampler;
+    }
+    if (!targetView || !targetSamplerToUse) {
+      console.warn('Metric map: no target texture available for comparison.');
+      return;
+    }
+    metric_map_bind_group = device.createBindGroup({
+      label: 'metric map bind group',
+      layout: metric_map_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: targetSamplerToUse },
+        { binding: 1, resource: targetView },
+        { binding: 2, resource: training_color_view },
+        { binding: 3, resource: { buffer: metric_pixel_buffer } },
+        { binding: 4, resource: { buffer: metric_image_params_buffer } },
+      ],
+    });
+  }
+
+  function rebuildMetricThresholdBindGroup() {
+    if (!metric_threshold_pipeline || !metric_pixel_buffer || !metric_flag_buffer || !metric_threshold_params_buffer) {
+      return;
+    }
+    metric_threshold_bind_group = device.createBindGroup({
+      label: 'metric threshold bind group',
+      layout: metric_threshold_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: metric_pixel_buffer } },
+        { binding: 1, resource: { buffer: metric_flag_buffer } },
+        { binding: 2, resource: { buffer: metric_threshold_params_buffer } },
+      ],
+    });
+  }
+
+  function rebuildMetricAccumBindGroup() {
+    ensureTilingParamsBuffer();
+    if (!metric_accum_pipeline || !metric_flag_buffer || !tile_offsets_buffer ||
+      !flatten_ids_buffer || !gauss_projections_buffer || !training_last_ids_buffer ||
+      !tiling_params_buffer || !metric_counts_buffer || !active_count_uniform_buffer) {
+      return;
+    }
+    if (!metric_accum_params_buffer) {
+      metric_accum_params_buffer = device.createBuffer({
+        label: 'metric accum params',
+        size: 32,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    const pixelCount = training_width * training_height;
+    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
+    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const totalTiles = tileWidth * tileHeight;
+    const accumParams = new Uint32Array([
+      pixelCount,
+      canvas.width,
+      tileWidth,
+      tileHeight,
+      TILE_SIZE,
+      active_count,
+      totalTiles,
+      0,
+    ]);
+    device.queue.writeBuffer(metric_accum_params_buffer, 0, accumParams);
+    metric_accum_bind_group = device.createBindGroup({
+      label: 'metric accumulate bind group',
+      layout: metric_accum_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: metric_flag_buffer } },
+        { binding: 1, resource: { buffer: tile_offsets_buffer } },
+        { binding: 2, resource: { buffer: flatten_ids_buffer } },
+        { binding: 3, resource: { buffer: gauss_projections_buffer! } },
+        { binding: 4, resource: { buffer: training_last_ids_buffer! } },
+        { binding: 5, resource: { buffer: tiling_params_buffer! } },
+        { binding: 6, resource: { buffer: metric_accum_params_buffer } },
+        { binding: 7, resource: { buffer: metric_counts_buffer! } },
+      ],
+    });
+  }
+
   function rebuildAllBindGroups() {
     rebuildSorterBG();
     rebuildSortedBG();
     rebuildRenderSplatBG();
     rebuildPreprocessBG();
     rebuildKnnInitBG();
-    rebuildPruneBG();
-    rebuildDensifyBG();
     rebuildTrainingBackwardGeomBG();
     // Tiled training bind groups are rebuilt lazily when running tiled passes.
     rebuildTrainingInitParamsBG();
     rebuildTrainingApplyParamsBG();
+    // Densification gradient accumulation bind groups
+    rebuildDensifyAccumBindGroup();
+    rebuildImportanceAccumBindGroup();
+    importanceManager.ensureCapacity(active_count);
+    rebuildPruneDecideBindGroup();
   }
 
   function run_training_tiles_projection(encoder: GPUCommandEncoder) {
     if (!training_tiles_project_pipeline ||
-        !gaussian_buffer ||
-        !gauss_projections_buffer ||
-        !projection_params_buffer ||
-        !active_count_uniform_buffer) {
+      !gaussian_buffer ||
+      !gauss_projections_buffer ||
+      !projection_params_buffer ||
+      !active_count_uniform_buffer) {
       return;
     }
 
@@ -1551,15 +1712,25 @@ export default function get_renderer(
     ensureIntersectionBuffers(totalIntersections);
 
     if (totalIntersections === 0) {
+      // CORRECTION: Even with 0 intersections, we must reset tile_offsets_buffer.
+      // Otherwise it contains stale data, causing the renderer to access out-of-bounds intersections.
+      if (tile_offsets_buffer) {
+        const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
+        const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+        const totalTiles = tileWidth * tileHeight;
+        const zeroOffsets = new Uint32Array(totalTiles + 1);
+        // default init is 0, which is correct for 0 intersections
+        device.queue.writeBuffer(tile_offsets_buffer, 0, zeroOffsets);
+      }
       tilesBuilt = true;
       return;
     }
 
     if (!training_tiles_emit_pipeline ||
-        !gauss_projections_buffer ||
-        !tiles_cumsum_buffer ||
-        !isect_ids_buffer || !flatten_ids_buffer ||
-        !active_count_uniform_buffer) {
+      !gauss_projections_buffer ||
+      !tiles_cumsum_buffer ||
+      !isect_ids_buffer || !flatten_ids_buffer ||
+      !active_count_uniform_buffer) {
       return;
     }
 
@@ -1705,6 +1876,22 @@ export default function get_renderer(
     tilesBuilt = true;
   }
 
+  async function rebuildTilesForCurrentCamera(): Promise<void> {
+    tilesBuilt = false;
+    tilesBuiltForCameraIndex = -1;
+    if (training_camera_buffers.length === 0) {
+      return;
+    }
+    try {
+      await buildTileIntersections();
+      tilesBuiltForCameraIndex = current_training_camera_index;
+    } catch (err) {
+      console.error('[tiles] Failed to rebuild training tiles:', err);
+      tilesBuilt = false;
+      tilesBuiltForCameraIndex = -1;
+    }
+  }
+
   // ===============================================
   // Capacity Management
   // ===============================================
@@ -1717,6 +1904,17 @@ export default function get_renderer(
     sorter = get_sorter(capacity, device);
     rebuildAllBindGroups();
     setActiveCount(active_count);
+    importanceManager?.ensureCapacity(want);
+    importanceManager?.resetStats(want);
+    importanceManager?.resetPruneActions(want);
+    if (!metric_counts_buffer || metric_counts_buffer.size < want * 4) {
+      metric_counts_buffer?.destroy();
+      metric_counts_buffer = device.createBuffer({
+        label: 'metric gaussian counts',
+        size: want * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
+    }
   }
 
   function resizeToActiveCount() {
@@ -1725,6 +1923,19 @@ export default function get_renderer(
       recreateBuffers(target_capacity, true);
       sorter = get_sorter(target_capacity, device);
       rebuildAllBindGroups();
+      importanceManager?.ensureCapacity(target_capacity);
+      importanceManager?.resetStats(target_capacity);
+      importanceManager?.resetPruneActions(target_capacity);
+    }
+  }
+
+  function updateSceneExtent(newExtent: number) {
+    sceneExtent = newExtent;
+    if (trainingController) {
+      trainingController.setSceneExtent(newExtent);
+    }
+    if (densificationManager) {
+      densificationManager.setSceneExtent(newExtent);
     }
   }
 
@@ -1733,6 +1944,20 @@ export default function get_renderer(
   // ===============================================
   function reloadPointCloud(new_pc: PointCloud) {
     pc_data = new_pc;
+
+    // Update scene extent and training controller
+    updateSceneExtent(new_pc.scene_extent ?? 1.0);
+    trainingController = new TrainingController(sceneExtent);
+
+    // Initialize densification manager
+    densificationManager?.destroy();
+    densificationManager = new DensificationManager(device, sceneExtent);
+    densificationManager.ensureCapacity(new_pc.num_points);
+    importanceManager = new ImportanceManager(device);
+    importanceManager.ensureCapacity(new_pc.num_points);
+
+    console.log(`[reloadPointCloud] Scene extent: ${sceneExtent.toFixed(2)}, training controller initialized`);
+
     setActiveCount(new_pc.num_points);
     ensureCapacity(new_pc.num_points);
     const encoder = device.createCommandEncoder();
@@ -1783,166 +2008,53 @@ export default function get_renderer(
     console.log("Syncing training params from gaussians buffer...");
     run_training_init_params(encoder);
   }
-  
+
   async function initializeKnnAndSync(): Promise<void> {
     const encoder = device.createCommandEncoder();
     initializeKnn(encoder);
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
-    
+
     const syncEncoder = device.createCommandEncoder();
     syncTrainingParams(syncEncoder);
     device.queue.submit([syncEncoder.finish()]);
     await device.queue.onSubmittedWorkDone();
-    
+
     console.log("k-NN initialization and training param sync complete.");
   }
 
   // ===============================================
   // Pruning
   // ===============================================
-  async function prune(): Promise<number> {
-    if (!prune_bind_group || active_count === 0) {
-      return active_count;
-    }
 
-    ensureCapacity(active_count);
-    rebuildPruneBG();
-    const safe_input_count = Math.min(active_count, capacity);
-    device.queue.writeBuffer(prune_input_count_buffer!, 0, new Uint32Array([safe_input_count]));
-    device.queue.writeBuffer(active_count_buffer!, 0, new Uint32Array([0]));
-
-    if (safe_input_count === 0) {
-      return active_count;
-    }
-
-    const encoder = device.createCommandEncoder();
-    const num_wg = Math.ceil(safe_input_count / WORKGROUP_SIZE);
-    const pass = encoder.beginComputePass({ label: 'prune' });
-    pass.setPipeline(prune_pipeline);
-    pass.setBindGroup(0, prune_bind_group);
-    pass.dispatchWorkgroups(num_wg);
-    pass.end();
-
-    const staging_buffer = device.createBuffer({
-      size: 4,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
-    encoder.copyBufferToBuffer(active_count_buffer!, 0, staging_buffer, 0, 4);
-    device.queue.submit([encoder.finish()]);
-
-    await device.queue.onSubmittedWorkDone();
-    await staging_buffer.mapAsync(GPUMapMode.READ);
-
-    const mapped = staging_buffer.getMappedRange();
-    const new_count = new Uint32Array(mapped)[0];
-    staging_buffer.unmap();
-    staging_buffer.destroy();
-
-    const safe_count = Math.min(new_count, capacity);
-    if (safe_count > 0) {
-      const copy_encoder = device.createCommandEncoder();
-      const gaussian_size = safe_count * BYTES_PER_GAUSSIAN;
-      const sh_size = safe_count * BYTES_PER_SH;
-      const density_size = safe_count * 4;
-
-      copy_encoder.copyBufferToBuffer(gaussian_buffer_temp!, 0, gaussian_buffer!, 0, gaussian_size);
-      copy_encoder.copyBufferToBuffer(sh_buffer_temp!, 0, sh_buffer!, 0, sh_size);
-      copy_encoder.copyBufferToBuffer(density_buffer_temp!, 0, density_buffer!, 0, density_size);
-      device.queue.submit([copy_encoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
-    }
-
-    setActiveCount(safe_count);
-    tilesBuilt = false;
-    resizeToActiveCount();
-    camera.needsPreprocess = true;
-
-    if (safe_count > 0) {
-      rebuildKnnInitBG();
-      const knn_encoder = device.createCommandEncoder();
-      initializeKnn(knn_encoder);
-      device.queue.submit([knn_encoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
-    }
-
-    return safe_count;
-  }
-
-  // ===============================================
-  // Densification
-  // ===============================================
-  async function densify(): Promise<number> {
-    if (!densify_bind_group || !targetTextureView || active_count === 0) {
-      return active_count;
-    }
-
-    ensureCapacity(active_count * 2);
-    rebuildDensifyBG();
-
-    setActiveCount(active_count);
-    device.queue.writeBuffer(active_count_buffer!, 0, new Uint32Array([0]));
-
+  /**
+   * Prune gaussians based on current training controller settings.
+   * Uses FastGS-style pruning: opacity + world-scale thresholds.
+   * @param customParams Optional custom prune params (overrides controller)
+  */
+  async function prune(customParams?: PruneParams): Promise<number> {
     if (active_count === 0) {
       return active_count;
     }
 
-    const encoder = device.createCommandEncoder();
-    const num_wg = Math.ceil(active_count / WORKGROUP_SIZE);
-    const pass = encoder.beginComputePass({ label: 'densify' });
-    pass.setPipeline(densify_pipeline);
-    pass.setBindGroup(0, densify_bind_group);
-    pass.dispatchWorkgroups(num_wg);
-    pass.end();
+    renderingSuspended = true;
 
-    const staging_buffer = device.createBuffer({
-      size: 4,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
-    encoder.copyBufferToBuffer(active_count_buffer!, 0, staging_buffer, 0, 4);
-    device.queue.submit([encoder.finish()]);
-
-    await device.queue.onSubmittedWorkDone();
-    await staging_buffer.mapAsync(GPUMapMode.READ);
-
-    const mapped = staging_buffer.getMappedRange();
-    const num_new = new Uint32Array(mapped)[0];
-    staging_buffer.unmap();
-    staging_buffer.destroy();
-
-    const max_new = capacity - active_count;
-    const safe_num_new = Math.min(num_new, max_new);
-
-    if (safe_num_new > 0) {
-      const copy_encoder = device.createCommandEncoder();
-      const gaussian_offset = active_count * BYTES_PER_GAUSSIAN;
-      const sh_offset = active_count * BYTES_PER_SH;
-      const density_offset = active_count * 4;
-      const gaussian_size = safe_num_new * BYTES_PER_GAUSSIAN;
-      const sh_size = safe_num_new * BYTES_PER_SH;
-      const density_size = safe_num_new * 4;
-
-      copy_encoder.copyBufferToBuffer(gaussian_buffer_temp!, 0, gaussian_buffer!, gaussian_offset, gaussian_size);
-      copy_encoder.copyBufferToBuffer(sh_buffer_temp!, 0, sh_buffer!, sh_offset, sh_size);
-        copy_encoder.copyBufferToBuffer(density_buffer_temp!, 0, density_buffer!, density_offset, density_size);
-      device.queue.submit([copy_encoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
+    try {
+      const multiView = await getMultiViewScores();
+      if (!multiView || multiView.sampleCount === 0) {
+        console.warn('[prune] Unable to compute multi-view scores; skipping.');
+        return active_count;
+      }
+      const pruned = await applyMultiViewPrune(multiView, active_count);
+      if (pruned > 0) {
+        console.log(`[prune] Removed ${pruned} gaussians (remaining ${active_count})`);
+      } else {
+        console.log('[prune] No gaussians removed');
+      }
+      return active_count;
+    } finally {
+      renderingSuspended = false;
     }
-
-    const new_active_count = active_count + safe_num_new;
-    setActiveCount(new_active_count);
-    tilesBuilt = false;
-    camera.needsPreprocess = true;
-
-    if (new_active_count > 0) {
-      rebuildKnnInitBG();
-      const knn_encoder = device.createCommandEncoder();
-      initializeKnn(knn_encoder);
-      device.queue.submit([knn_encoder.finish()]);
-      await device.queue.onSubmittedWorkDone();
-    }
-
-    return new_active_count;
   }
 
   // ===============================================
@@ -2203,7 +2315,9 @@ export default function get_renderer(
     const lr_scale = SCALING_LR;
     const lr_rotation = ROTATION_LR;
 
-    if (sh_elements > 0) {
+    // Only update SH every SH_UPDATE_INTERVAL iterations (FastGS does every 16)
+    const shouldUpdateSH = (trainingIteration % SH_UPDATE_INTERVAL) === 0;
+    if (sh_elements > 0 && shouldUpdateSH) {
       run_adam_on_buffer(
         encoder,
         train_sh_buffer,
@@ -2266,6 +2380,927 @@ export default function get_renderer(
     adam_step_counter += 1;
   }
 
+  // ===============================================
+  // Densification - Gradient Accumulation
+  // ===============================================
+
+  function rebuildDensifyAccumBindGroup(): void {
+    if (!densifyAccumPipeline || !grad_geom_buffer || !densificationManager) return;
+
+    const gradAccumBuffer = densificationManager.getGradAccumBuffer();
+    if (!gradAccumBuffer) return;
+
+    // Create a uniform buffer for active_count
+    const activeCountBuffer = device.createBuffer({
+      label: 'densify active count',
+      size: 4,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(activeCountBuffer, 0, new Uint32Array([active_count]));
+
+    densifyAccumBindGroup = device.createBindGroup({
+      label: 'densify accum bind group',
+      layout: densifyAccumPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: grad_geom_buffer } },
+        { binding: 1, resource: { buffer: gradAccumBuffer } },
+        { binding: 2, resource: { buffer: activeCountBuffer } },
+      ],
+    });
+  }
+
+  function rebuildDensifyDecideBindGroup(): void {
+    if (!densifyDecidePipeline || !train_scale_buffer || !densificationManager || !densifyParamsBuffer || !importanceManager) return;
+
+    const gradAccumBuffer = densificationManager.getGradAccumBuffer();
+    const actionsBuffer = densificationManager.getDensifyOutputBuffer();
+    const countsBuffer = densificationManager.getCountBuffer();
+    const statsBuffer = importanceManager.getStatsBuffer();
+    if (!gradAccumBuffer || !actionsBuffer || !countsBuffer || !statsBuffer) return;
+
+    densifyDecideBindGroup = device.createBindGroup({
+      label: 'densify decide bind group',
+      layout: densifyDecidePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gradAccumBuffer } },
+        { binding: 1, resource: { buffer: train_scale_buffer } },
+        { binding: 2, resource: { buffer: actionsBuffer } },
+        { binding: 3, resource: { buffer: countsBuffer } },
+        { binding: 4, resource: { buffer: densifyParamsBuffer } },
+        { binding: 5, resource: { buffer: statsBuffer } },
+      ],
+    });
+  }
+
+  function run_densify_accumulate(encoder: GPUCommandEncoder): void {
+    if (!densifyAccumBindGroup || !densifyAccumPipeline || active_count === 0) return;
+
+    const num_wg = Math.ceil(active_count / 256);
+    const pass = encoder.beginComputePass({ label: 'densify accumulate' });
+    pass.setPipeline(densifyAccumPipeline);
+    pass.setBindGroup(0, densifyAccumBindGroup);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  function run_densify_decide(encoder: GPUCommandEncoder): void {
+    if (!densifyDecideBindGroup || !densifyDecidePipeline || !densificationManager || !densifyParamsBuffer) return;
+    if (active_count === 0) return;
+
+    // Update params buffer with dynamic visibility gating tied to densification interval
+    const paramsData = densificationManager.createDensifyUniformData(active_count);
+
+    // CRITICAL FIX: Scale gradient thresholds to pixel space.
+    // The config thresholds (e.g. 0.0002) are based on NDC space (0-1).
+    // Our gradients are in pixel space (0-W), so they are ~W/2 times larger.
+    const pixelScale = canvas.width / 2.0;
+    paramsData[0] *= pixelScale; // gradThreshold
+    paramsData[1] *= pixelScale; // gradAbsThreshold
+
+    const interval =
+      trainingController?.getConfig().densificationInterval ??
+      DEFAULT_TRAINING_SCHEDULE.densificationInterval;
+    const dynamicVisibility = Math.max(paramsData[5], Math.max(5, Math.round(interval * 0.35)));
+    paramsData[5] = dynamicVisibility;
+    device.queue.writeBuffer(densifyParamsBuffer, 0, paramsData);
+
+    // Reset counts
+    densificationManager.resetCounts();
+
+    const num_wg = Math.ceil(active_count / 256);
+    const pass = encoder.beginComputePass({ label: 'densify decide' });
+    pass.setPipeline(densifyDecidePipeline);
+    pass.setBindGroup(0, densifyDecideBindGroup);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  function run_metric_map(encoder: GPUCommandEncoder): void {
+    if (!metric_map_pipeline) return;
+    rebuildMetricMapBindGroup();
+    if (!metric_map_bind_group || training_width === 0 || training_height === 0) return;
+    const pass = encoder.beginComputePass({ label: 'metric map' });
+    pass.setPipeline(metric_map_pipeline);
+    pass.setBindGroup(0, metric_map_bind_group);
+    pass.dispatchWorkgroups(Math.ceil(training_width / 8), Math.ceil(training_height / 8));
+    pass.end();
+  }
+
+  function run_metric_threshold(encoder: GPUCommandEncoder): void {
+    if (!metric_threshold_pipeline) return;
+    rebuildMetricThresholdBindGroup();
+    if (!metric_threshold_bind_group || training_width === 0 || training_height === 0) return;
+    const pixelCount = training_width * training_height;
+    const numWG = Math.ceil(pixelCount / WORKGROUP_SIZE);
+    const pass = encoder.beginComputePass({ label: 'metric threshold' });
+    pass.setPipeline(metric_threshold_pipeline);
+    pass.setBindGroup(0, metric_threshold_bind_group);
+    pass.dispatchWorkgroups(numWG);
+    pass.end();
+  }
+
+  function run_metric_accumulate(encoder: GPUCommandEncoder): void {
+    if (!metric_accum_pipeline) return;
+    rebuildMetricAccumBindGroup();
+    if (!metric_accum_bind_group || training_width === 0 || training_height === 0) return;
+    const pixelCount = training_width * training_height;
+    const numWG = Math.ceil(pixelCount / WORKGROUP_SIZE);
+    const pass = encoder.beginComputePass({ label: 'metric accumulate' });
+    pass.setPipeline(metric_accum_pipeline);
+    pass.setBindGroup(0, metric_accum_bind_group);
+    pass.dispatchWorkgroups(numWG);
+    pass.end();
+  }
+
+  function sampleCameraIndices(count: number): number[] {
+    const total = training_cameras.length;
+    if (count >= total) {
+      return Array.from({ length: total }, (_, i) => i);
+    }
+    const indices = Array.from({ length: total }, (_, i) => i);
+    for (let i = indices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [indices[i], indices[j]] = [indices[j], indices[i]];
+    }
+    return indices.slice(0, count);
+  }
+
+  async function renderCameraForMetrics(cameraIndex: number): Promise<boolean> {
+    if (training_cameras.length === 0 || training_images.length === 0) {
+      return false;
+    }
+    current_training_camera_index = cameraIndex;
+    if (!tilesBuilt || tilesBuiltForCameraIndex !== cameraIndex) {
+      await rebuildTilesForCurrentCamera();
+      tilesBuiltForCameraIndex = cameraIndex;
+    }
+    const encoder = device.createCommandEncoder();
+    run_training_tiled_forward(encoder);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    return true;
+  }
+
+  async function computePixelLossStats(): Promise<{ minValue: number; maxValue: number; meanLoss: number } | null> {
+    if (!metric_pixel_buffer || !metric_threshold_params_buffer || training_width === 0 || training_height === 0) {
+      return null;
+    }
+    rebuildMetricMapBindGroup();
+    if (!metric_map_bind_group) return null;
+    const encoder = device.createCommandEncoder();
+    run_metric_map(encoder);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    const pixelCount = training_width * training_height;
+    const pixelData = await readBufferToCPU(metric_pixel_buffer, pixelCount * FLOAT32_BYTES);
+    let minValue = Number.POSITIVE_INFINITY;
+    let maxValue = Number.NEGATIVE_INFINITY;
+    let sum = 0;
+    for (let i = 0; i < pixelData.length; i++) {
+      const v = pixelData[i];
+      if (!Number.isFinite(v)) continue;
+      if (v < minValue) minValue = v;
+      if (v > maxValue) maxValue = v;
+      sum += v;
+    }
+    if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) {
+      return null;
+    }
+    const meanLoss = pixelCount > 0 ? sum / pixelCount : 0;
+    const invRange = maxValue > minValue ? 1.0 / (maxValue - minValue) : 0.0;
+    const thresholdBuffer = new ArrayBuffer(16);
+    const thresholdFloats = new Float32Array(thresholdBuffer);
+    const thresholdInts = new Uint32Array(thresholdBuffer);
+    thresholdFloats[0] = minValue;
+    thresholdFloats[1] = invRange;
+    thresholdFloats[2] = MULTI_VIEW_LOSS_THRESH;
+    thresholdInts[3] = training_width * training_height;
+    device.queue.writeBuffer(metric_threshold_params_buffer!, 0, thresholdBuffer);
+    return { minValue, maxValue, meanLoss };
+  }
+
+  async function accumulateMetricCounts(): Promise<Uint32Array | null> {
+    if (!metric_counts_buffer) return null;
+    const zeroCounts = new Uint32Array(Math.max(active_count, 1));
+    device.queue.writeBuffer(metric_counts_buffer, 0, zeroCounts);
+    const encoder = device.createCommandEncoder();
+    run_metric_threshold(encoder);
+    run_metric_accumulate(encoder);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+    return readBufferToCPU_u32(metric_counts_buffer, active_count * 4);
+  }
+
+  async function generateMultiViewScores(): Promise<MultiViewScores | null> {
+    if (training_cameras.length === 0 || training_images.length === 0 || active_count === 0) {
+      return null;
+    }
+    const sampleCount = Math.min(MULTI_VIEW_SAMPLE_COUNT, training_cameras.length);
+    if (sampleCount === 0) {
+      return null;
+    }
+    const indices = sampleCameraIndices(sampleCount);
+    const importance = new Uint32Array(active_count);
+    const pruning = new Float32Array(active_count);
+    for (const idx of indices) {
+      const rendered = await renderCameraForMetrics(idx);
+      if (!rendered) {
+        continue;
+      }
+      const stats = await computePixelLossStats();
+      if (!stats) {
+        continue;
+      }
+      const counts = await accumulateMetricCounts();
+      if (!counts) {
+        continue;
+      }
+      for (let i = 0; i < active_count; i++) {
+        const c = counts[i];
+        importance[i] += c;
+        pruning[i] += c * stats.meanLoss;
+      }
+    }
+    return { importance, pruning, sampleCount: indices.length };
+  }
+
+  async function getMultiViewScores(): Promise<MultiViewScores | null> {
+    if (cachedMultiViewScores && cachedMultiViewIteration === trainingIteration) {
+      return cachedMultiViewScores;
+    }
+    const result = await generateMultiViewScores();
+    cachedMultiViewScores = result;
+    cachedMultiViewIteration = trainingIteration;
+    return result;
+  }
+
+  async function applyMultiViewPrune(scores: MultiViewScores, baseCount: number): Promise<number> {
+    if (!train_scale_buffer || !train_opacity_buffer) {
+      return 0;
+    }
+    if (active_count === 0 || scores.sampleCount === 0) {
+      return 0;
+    }
+    const prunable = new Array<boolean>(active_count).fill(false);
+    const opacities = await readBufferToCPU(train_opacity_buffer, active_count * FLOAT32_BYTES);
+    const scales = await readBufferToCPU(train_scale_buffer, active_count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES);
+    const minOpacity = trainingController?.getConfig().minOpacity ?? DEFAULT_TRAINING_SCHEDULE.minOpacity;
+    const scaleThreshold = sceneExtent * 0.1;
+    for (let i = 0; i < active_count; i++) {
+      const value = 1 / (1 + Math.exp(-opacities[i]));
+      if (value < minOpacity) {
+        prunable[i] = true;
+        continue;
+      }
+      const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+      const maxScale = Math.max(
+        Math.exp(scales[scaleBase]),
+        Math.exp(scales[scaleBase + 1]),
+        Math.exp(scales[scaleBase + 2]),
+      );
+      if (maxScale > scaleThreshold) {
+        prunable[i] = true;
+      }
+    }
+
+    const limit = Math.min(baseCount, scores.pruning.length);
+    let minScore = Number.POSITIVE_INFINITY;
+    let maxScore = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < limit; i++) {
+      const val = scores.pruning[i];
+      if (!Number.isFinite(val)) continue;
+      if (val < minScore) minScore = val;
+      if (val > maxScore) maxScore = val;
+    }
+    if (!Number.isFinite(minScore) || !Number.isFinite(maxScore)) {
+      return 0;
+    }
+    const range = Math.max(1e-6, maxScore - minScore);
+    const normalizedScores = new Float32Array(active_count);
+    for (let i = 0; i < limit; i++) {
+      normalizedScores[i] = (scores.pruning[i] - minScore) / range;
+    }
+
+    let toRemove = 0;
+    for (let i = 0; i < prunable.length; i++) {
+      if (prunable[i]) toRemove++;
+    }
+    const removeBudget = Math.floor(0.5 * toRemove);
+    if (removeBudget <= 0) {
+      return 0;
+    }
+
+    const weights = new Float32Array(active_count);
+    let totalWeight = 0;
+    for (let i = 0; i < active_count; i++) {
+      if (!prunable[i]) continue;
+      const score = normalizedScores[i];
+      const w = 1.0 / (1e-6 + (1.0 - score));
+      weights[i] = w;
+      totalWeight += w;
+    }
+    if (totalWeight === 0) {
+      return 0;
+    }
+
+    const selected = new Array<boolean>(active_count).fill(false);
+    for (let k = 0; k < removeBudget && totalWeight > 0; k++) {
+      const target = Math.random() * totalWeight;
+      let accum = 0;
+      for (let i = 0; i < active_count; i++) {
+        const w = weights[i];
+        if (w === 0) continue;
+        accum += w;
+        if (target <= accum) {
+          selected[i] = true;
+          totalWeight -= w;
+          weights[i] = 0;
+          break;
+        }
+      }
+    }
+
+    const finalMask = selected.map((chosen, idx) => chosen && prunable[idx]);
+    return applyPruneMask(finalMask);
+  }
+
+  async function applyPruneMask(mask: boolean[]): Promise<number> {
+    if (!train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+      !train_opacity_buffer || !train_sh_buffer) {
+      return 0;
+    }
+    const removeCount = mask.reduce((sum, flag) => sum + (flag ? 1 : 0), 0);
+    if (removeCount === 0 || removeCount >= active_count) {
+      return 0;
+    }
+    const keepCount = active_count - removeCount;
+    const positions = await readBufferToCPU(train_position_buffer, active_count * TRAIN_POS_COMPONENTS * FLOAT32_BYTES);
+    const scales = await readBufferToCPU(train_scale_buffer, active_count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES);
+    const rotations = await readBufferToCPU(train_rotation_buffer, active_count * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES);
+    const opacities = await readBufferToCPU(train_opacity_buffer, active_count * FLOAT32_BYTES);
+    const shs = await readBufferToCPU(train_sh_buffer, active_count * TRAIN_SH_COMPONENTS * FLOAT32_BYTES);
+    const params = await readAdamMoments(active_count);
+
+    const newPositions = new Float32Array(keepCount * TRAIN_POS_COMPONENTS);
+    const newScales = new Float32Array(keepCount * TRAIN_SCALE_COMPONENTS);
+    const newRotations = new Float32Array(keepCount * TRAIN_ROT_COMPONENTS);
+    const newOpacities = new Float32Array(keepCount);
+    const newSHs = new Float32Array(keepCount * TRAIN_SH_COMPONENTS);
+    const newMoments: AdamMoments = {
+      opacity_m1: new Float32Array(keepCount),
+      opacity_m2: new Float32Array(keepCount),
+      pos_m1: new Float32Array(keepCount * TRAIN_POS_COMPONENTS),
+      pos_m2: new Float32Array(keepCount * TRAIN_POS_COMPONENTS),
+      scale_m1: new Float32Array(keepCount * TRAIN_SCALE_COMPONENTS),
+      scale_m2: new Float32Array(keepCount * TRAIN_SCALE_COMPONENTS),
+      rot_m1: new Float32Array(keepCount * TRAIN_ROT_COMPONENTS),
+      rot_m2: new Float32Array(keepCount * TRAIN_ROT_COMPONENTS),
+      sh_m1: new Float32Array(keepCount * TRAIN_SH_COMPONENTS),
+      sh_m2: new Float32Array(keepCount * TRAIN_SH_COMPONENTS),
+    };
+
+    let writeIdx = 0;
+    for (let i = 0; i < active_count; i++) {
+      if (mask[i]) continue;
+      const posBase = i * TRAIN_POS_COMPONENTS;
+      const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+      const rotBase = i * TRAIN_ROT_COMPONENTS;
+      const shBase = i * TRAIN_SH_COMPONENTS;
+      const newPosBase = writeIdx * TRAIN_POS_COMPONENTS;
+      const newScaleBase = writeIdx * TRAIN_SCALE_COMPONENTS;
+      const newRotBase = writeIdx * TRAIN_ROT_COMPONENTS;
+      const newShBase = writeIdx * TRAIN_SH_COMPONENTS;
+      newPositions.set(positions.slice(posBase, posBase + TRAIN_POS_COMPONENTS), newPosBase);
+      newScales.set(scales.slice(scaleBase, scaleBase + TRAIN_SCALE_COMPONENTS), newScaleBase);
+      newRotations.set(rotations.slice(rotBase, rotBase + TRAIN_ROT_COMPONENTS), newRotBase);
+      newSHs.set(shs.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+      newOpacities[writeIdx] = opacities[i];
+      newMoments.opacity_m1[writeIdx] = params.opacity_m1[i];
+      newMoments.opacity_m2[writeIdx] = params.opacity_m2[i];
+      newMoments.pos_m1.set(params.pos_m1.slice(posBase, posBase + TRAIN_POS_COMPONENTS), newPosBase);
+      newMoments.pos_m2.set(params.pos_m2.slice(posBase, posBase + TRAIN_POS_COMPONENTS), newPosBase);
+      newMoments.scale_m1.set(params.scale_m1.slice(scaleBase, scaleBase + TRAIN_SCALE_COMPONENTS), newScaleBase);
+      newMoments.scale_m2.set(params.scale_m2.slice(scaleBase, scaleBase + TRAIN_SCALE_COMPONENTS), newScaleBase);
+      newMoments.rot_m1.set(params.rot_m1.slice(rotBase, rotBase + TRAIN_ROT_COMPONENTS), newRotBase);
+      newMoments.rot_m2.set(params.rot_m2.slice(rotBase, rotBase + TRAIN_ROT_COMPONENTS), newRotBase);
+      newMoments.sh_m1.set(params.sh_m1.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+      newMoments.sh_m2.set(params.sh_m2.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+      writeIdx++;
+    }
+
+    device.queue.writeBuffer(train_position_buffer!, 0, newPositions);
+    device.queue.writeBuffer(train_scale_buffer!, 0, newScales);
+    device.queue.writeBuffer(train_rotation_buffer!, 0, newRotations);
+    device.queue.writeBuffer(train_opacity_buffer!, 0, newOpacities);
+    device.queue.writeBuffer(train_sh_buffer!, 0, newSHs);
+    writeAdamMoments(newMoments);
+
+    setActiveCount(keepCount);
+    densificationManager?.resetAccumulators(keepCount);
+    importanceManager?.resetStats(keepCount);
+    importanceManager?.resetPruneActions(keepCount);
+    await syncGaussianBufferFromTrainingParams();
+    rebuildAllBindGroups();
+    rebuildDensifyAccumBindGroup();
+    await rebuildTilesForCurrentCamera();
+    return removeCount;
+  }
+
+  function run_importance_accumulate(encoder: GPUCommandEncoder): void {
+    if (!importanceAccumPipeline || !importanceAccumBindGroup || !importanceManager || !importanceAccumParamsBuffer) return;
+    if (!gauss_projections_buffer || active_count === 0) return;
+
+    const paramsData = importanceManager.createAccumParams(active_count);
+    device.queue.writeBuffer(importanceAccumParamsBuffer, 0, paramsData);
+
+    const num_wg = Math.ceil(active_count / WORKGROUP_SIZE);
+    const pass = encoder.beginComputePass({ label: 'importance accumulate' });
+    pass.setPipeline(importanceAccumPipeline);
+    pass.setBindGroup(0, importanceAccumBindGroup);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  function run_prune_decide(encoder: GPUCommandEncoder, pruneParams: PruneParams): void {
+    if (!pruneDecidePipeline || !pruneDecideBindGroup || !importanceManager || !pruneDecideParamsBuffer) return;
+    if (active_count === 0) return;
+
+    const thresholds = {
+      minOpacity: pruneParams.minOpacity,
+      maxScale: pruneParams.maxScale,
+      maxScreenRadius: pruneParams.useScreenSizePruning ? pruneParams.maxScreenRadius : 10000.0,
+    };
+    const paramsData = importanceManager.createPruneParams(active_count, thresholds);
+    device.queue.writeBuffer(pruneDecideParamsBuffer, 0, paramsData);
+
+    const num_wg = Math.ceil(active_count / WORKGROUP_SIZE);
+    const pass = encoder.beginComputePass({ label: 'prune decide' });
+    pass.setPipeline(pruneDecidePipeline);
+    pass.setBindGroup(0, pruneDecideBindGroup);
+    pass.dispatchWorkgroups(num_wg);
+    pass.end();
+  }
+
+  /**
+   * Helper to read a GPU buffer to CPU
+   */
+  async function readBufferToCPU(buffer: GPUBuffer, size: number): Promise<Float32Array> {
+    const staging = device.createBuffer({
+      label: 'staging read',
+      size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, staging, 0, size);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const data = new Float32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+
+    return data;
+  }
+
+  /**
+   * Helper to read a GPU buffer as Uint32Array
+   */
+  async function readBufferToCPU_u32(buffer: GPUBuffer, size: number): Promise<Uint32Array> {
+    const staging = device.createBuffer({
+      label: 'staging read u32',
+      size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, staging, 0, size);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await staging.mapAsync(GPUMapMode.READ);
+    const data = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+
+    return data;
+  }
+
+  /**
+   * Build a rotation matrix from quaternion (for split position sampling)
+   */
+  function quatToMat3(q: number[]): number[][] {
+    const [x, y, z, w] = q;
+    const x2 = x + x, y2 = y + y, z2 = z + z;
+    const xx = x * x2, xy = x * y2, xz = x * z2;
+    const yy = y * y2, yz = y * z2, zz = z * z2;
+    const wx = w * x2, wy = w * y2, wz = w * z2;
+
+    return [
+      [1 - (yy + zz), xy - wz, xz + wy],
+      [xy + wz, 1 - (xx + zz), yz - wx],
+      [xz - wy, yz + wx, 1 - (xx + yy)],
+    ];
+  }
+
+  /**
+   * Sample a random 3D point from gaussian distribution
+   */
+  function sampleGaussian3D(mean: number[], std: number[]): number[] {
+    // Box-Muller transform for normal distribution
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const u3 = Math.random();
+    const u4 = Math.random();
+
+    const z0 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.sin(2 * Math.PI * u2);
+    const z2 = Math.sqrt(-2 * Math.log(u3)) * Math.cos(2 * Math.PI * u4);
+
+    return [
+      mean[0] + z0 * std[0],
+      mean[1] + z1 * std[1],
+      mean[2] + z2 * std[2],
+    ];
+  }
+
+  interface AdamMoments {
+    opacity_m1: Float32Array; opacity_m2: Float32Array;
+    pos_m1: Float32Array; pos_m2: Float32Array;
+    scale_m1: Float32Array; scale_m2: Float32Array;
+    rot_m1: Float32Array; rot_m2: Float32Array;
+    sh_m1: Float32Array; sh_m2: Float32Array;
+  }
+
+  async function readAdamMoments(count: number): Promise<AdamMoments> {
+    const empty = new Float32Array(0);
+    if (count === 0) {
+      return {
+        opacity_m1: empty, opacity_m2: empty,
+        pos_m1: empty, pos_m2: empty,
+        scale_m1: empty, scale_m2: empty,
+        rot_m1: empty, rot_m2: empty,
+        sh_m1: empty, sh_m2: empty,
+      };
+    }
+
+    // Read all moment buffers
+    // We can run these in parallel
+    const [
+      opacity_m1, opacity_m2,
+      pos_m1, pos_m2,
+      scale_m1, scale_m2,
+      rot_m1, rot_m2,
+      sh_m1, sh_m2
+    ] = await Promise.all([
+      readBufferToCPU(moment_opacity_m1_buffer, count * FLOAT32_BYTES),
+      readBufferToCPU(moment_opacity_m2_buffer, count * FLOAT32_BYTES),
+      readBufferToCPU(moment_position_m1_buffer, count * TRAIN_POS_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_position_m2_buffer, count * TRAIN_POS_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_scale_m1_buffer, count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_scale_m2_buffer, count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_rotation_m1_buffer, count * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_rotation_m2_buffer, count * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_sh_m1_buffer, count * TRAIN_SH_COMPONENTS * FLOAT32_BYTES),
+      readBufferToCPU(moment_sh_m2_buffer, count * TRAIN_SH_COMPONENTS * FLOAT32_BYTES),
+    ]);
+
+    return {
+      opacity_m1, opacity_m2,
+      pos_m1, pos_m2,
+      scale_m1, scale_m2,
+      rot_m1, rot_m2,
+      sh_m1, sh_m2
+    };
+  }
+
+  function writeAdamMoments(moments: AdamMoments) {
+    if (moment_opacity_m1_buffer) device.queue.writeBuffer(moment_opacity_m1_buffer, 0, moments.opacity_m1);
+    if (moment_opacity_m2_buffer) device.queue.writeBuffer(moment_opacity_m2_buffer, 0, moments.opacity_m2);
+
+    if (moment_position_m1_buffer) device.queue.writeBuffer(moment_position_m1_buffer, 0, moments.pos_m1);
+    if (moment_position_m2_buffer) device.queue.writeBuffer(moment_position_m2_buffer, 0, moments.pos_m2);
+
+    if (moment_scale_m1_buffer) device.queue.writeBuffer(moment_scale_m1_buffer, 0, moments.scale_m1);
+    if (moment_scale_m2_buffer) device.queue.writeBuffer(moment_scale_m2_buffer, 0, moments.scale_m2);
+
+    if (moment_rotation_m1_buffer) device.queue.writeBuffer(moment_rotation_m1_buffer, 0, moments.rot_m1);
+    if (moment_rotation_m2_buffer) device.queue.writeBuffer(moment_rotation_m2_buffer, 0, moments.rot_m2);
+
+    if (moment_sh_m1_buffer) device.queue.writeBuffer(moment_sh_m1_buffer, 0, moments.sh_m1);
+    if (moment_sh_m2_buffer) device.queue.writeBuffer(moment_sh_m2_buffer, 0, moments.sh_m2);
+  }
+
+  function resetAdamMoments(count: number): void {
+    if (count <= 0) return;
+
+    const zeroMomentsOpacity = new Float32Array(count);
+    const zeroMomentsPos = new Float32Array(count * TRAIN_POS_COMPONENTS);
+    const zeroMomentsScale = new Float32Array(count * TRAIN_SCALE_COMPONENTS);
+    const zeroMomentsRot = new Float32Array(count * TRAIN_ROT_COMPONENTS);
+    const zeroMomentsSH = new Float32Array(count * TRAIN_SH_COMPONENTS);
+
+    if (moment_opacity_m1_buffer) device.queue.writeBuffer(moment_opacity_m1_buffer, 0, zeroMomentsOpacity);
+    if (moment_opacity_m2_buffer) device.queue.writeBuffer(moment_opacity_m2_buffer, 0, zeroMomentsOpacity);
+    if (moment_position_m1_buffer) device.queue.writeBuffer(moment_position_m1_buffer, 0, zeroMomentsPos);
+    if (moment_position_m2_buffer) device.queue.writeBuffer(moment_position_m2_buffer, 0, zeroMomentsPos);
+    if (moment_scale_m1_buffer) device.queue.writeBuffer(moment_scale_m1_buffer, 0, zeroMomentsScale);
+    if (moment_scale_m2_buffer) device.queue.writeBuffer(moment_scale_m2_buffer, 0, zeroMomentsScale);
+    if (moment_rotation_m1_buffer) device.queue.writeBuffer(moment_rotation_m1_buffer, 0, zeroMomentsRot);
+    if (moment_rotation_m2_buffer) device.queue.writeBuffer(moment_rotation_m2_buffer, 0, zeroMomentsRot);
+    if (moment_sh_m1_buffer) device.queue.writeBuffer(moment_sh_m1_buffer, 0, zeroMomentsSH);
+    if (moment_sh_m2_buffer) device.queue.writeBuffer(moment_sh_m2_buffer, 0, zeroMomentsSH);
+  }
+
+  /**
+   * Perform densification: clone and split gaussians based on accumulated gradients
+   * This is done on CPU for simplicity - reads buffers, modifies, writes back.
+   */
+  async function performDensification(): Promise<{ cloned: number; split: number }> {
+    if (!densificationManager || active_count === 0) {
+      return { cloned: 0, split: 0 };
+    }
+
+    renderingSuspended = true;
+
+    try {
+      if (!train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+        !train_opacity_buffer || !train_sh_buffer) {
+        console.warn('[densify] Training buffers not ready');
+        return { cloned: 0, split: 0 };
+      }
+
+      const multiView = await getMultiViewScores();
+      if (!multiView || multiView.sampleCount === 0) {
+        densificationManager.resetAccumulators(active_count);
+        rebuildDensifyAccumBindGroup();
+        return { cloned: 0, split: 0 };
+      }
+
+      const gradBuffer = densificationManager.getGradAccumBuffer();
+      if (!gradBuffer) {
+        return { cloned: 0, split: 0 };
+      }
+
+      const gradData = await readBufferToCPU(gradBuffer, active_count * GRAD_ACCUM_STRIDE * FLOAT32_BYTES);
+      const positions = await readBufferToCPU(train_position_buffer, active_count * TRAIN_POS_COMPONENTS * FLOAT32_BYTES);
+      const scales = await readBufferToCPU(train_scale_buffer, active_count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES);
+      const rotations = await readBufferToCPU(train_rotation_buffer, active_count * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES);
+      const opacities = await readBufferToCPU(train_opacity_buffer, active_count * FLOAT32_BYTES);
+      const shs = await readBufferToCPU(train_sh_buffer, active_count * TRAIN_SH_COMPONENTS * FLOAT32_BYTES);
+      const params = await readAdamMoments(active_count);
+
+      const config = densificationManager.getConfig();
+      const sizeThreshold = densificationManager.getSizeThreshold();
+      const actions = new Uint32Array(active_count);
+      let cloneCount = 0;
+      let splitCount = 0;
+
+      for (let i = 0; i < active_count; i++) {
+        const denom = gradData[i * GRAD_ACCUM_STRIDE + GRAD_ACCUM_DENOM];
+        if (denom < Math.max(1, config.minVisibility)) {
+          continue;
+        }
+
+        const avgGrad = gradData[i * GRAD_ACCUM_STRIDE + GRAD_ACCUM_X] / denom;
+        const avgGradAbs = gradData[i * GRAD_ACCUM_STRIDE + GRAD_ACCUM_ABS] / denom;
+        const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+        const maxScale = Math.max(
+          Math.exp(scales[scaleBase]),
+          Math.exp(scales[scaleBase + 1]),
+          Math.exp(scales[scaleBase + 2])
+        );
+        const importanceCount = multiView.importance[i] / Math.max(1, multiView.sampleCount);
+
+        if (importanceCount <= MULTI_VIEW_IMPORTANCE_THRESHOLD) {
+          continue;
+        }
+
+        if (maxScale <= sizeThreshold && avgGrad >= config.gradThreshold) {
+          actions[i] = 1;
+          cloneCount++;
+        } else if (maxScale > sizeThreshold && avgGradAbs >= config.gradAbsThreshold) {
+          actions[i] = 2;
+          splitCount++;
+        }
+      }
+
+      if (cloneCount === 0 && splitCount === 0) {
+        densificationManager.resetAccumulators(active_count);
+        rebuildDensifyAccumBindGroup();
+        return { cloned: 0, split: 0 };
+      }
+
+      const counts = { clones: cloneCount, splits: splitCount };
+      const prevCount = active_count;
+      const newCount = active_count + cloneCount + splitCount;
+      const newPositions = new Float32Array(newCount * TRAIN_POS_COMPONENTS);
+      const newScales = new Float32Array(newCount * TRAIN_SCALE_COMPONENTS);
+      const newRotations = new Float32Array(newCount * TRAIN_ROT_COMPONENTS);
+      const newOpacities = new Float32Array(newCount);
+      const newSHs = new Float32Array(newCount * TRAIN_SH_COMPONENTS);
+      const newMoments: AdamMoments = {
+        opacity_m1: new Float32Array(newCount), opacity_m2: new Float32Array(newCount),
+        pos_m1: new Float32Array(newCount * TRAIN_POS_COMPONENTS), pos_m2: new Float32Array(newCount * TRAIN_POS_COMPONENTS),
+        scale_m1: new Float32Array(newCount * TRAIN_SCALE_COMPONENTS), scale_m2: new Float32Array(newCount * TRAIN_SCALE_COMPONENTS),
+        rot_m1: new Float32Array(newCount * TRAIN_ROT_COMPONENTS), rot_m2: new Float32Array(newCount * TRAIN_ROT_COMPONENTS),
+        sh_m1: new Float32Array(newCount * TRAIN_SH_COMPONENTS), sh_m2: new Float32Array(newCount * TRAIN_SH_COMPONENTS),
+      };
+
+      let writeIdx = 0;
+
+      for (let i = 0; i < active_count; i++) {
+        if (actions[i] === 2) {
+          continue;
+        }
+        const posBase = i * TRAIN_POS_COMPONENTS;
+        const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+        const rotBase = i * TRAIN_ROT_COMPONENTS;
+        const shBase = i * TRAIN_SH_COMPONENTS;
+        const newPosBase = writeIdx * TRAIN_POS_COMPONENTS;
+        const newScaleBase = writeIdx * TRAIN_SCALE_COMPONENTS;
+        const newRotBase = writeIdx * TRAIN_ROT_COMPONENTS;
+        const newShBase = writeIdx * TRAIN_SH_COMPONENTS;
+        newPositions.set(positions.slice(posBase, posBase + TRAIN_POS_COMPONENTS), newPosBase);
+        newScales.set(scales.slice(scaleBase, scaleBase + TRAIN_SCALE_COMPONENTS), newScaleBase);
+        newRotations.set(rotations.slice(rotBase, rotBase + TRAIN_ROT_COMPONENTS), newRotBase);
+        newSHs.set(shs.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+        newOpacities[writeIdx] = opacities[i];
+        newMoments.opacity_m1[writeIdx] = params.opacity_m1[i];
+        newMoments.opacity_m2[writeIdx] = params.opacity_m2[i];
+        newMoments.pos_m1.set(params.pos_m1.slice(posBase, posBase + TRAIN_POS_COMPONENTS), newPosBase);
+        newMoments.pos_m2.set(params.pos_m2.slice(posBase, posBase + TRAIN_POS_COMPONENTS), newPosBase);
+        newMoments.scale_m1.set(params.scale_m1.slice(scaleBase, scaleBase + TRAIN_SCALE_COMPONENTS), newScaleBase);
+        newMoments.scale_m2.set(params.scale_m2.slice(scaleBase, scaleBase + TRAIN_SCALE_COMPONENTS), newScaleBase);
+        newMoments.rot_m1.set(params.rot_m1.slice(rotBase, rotBase + TRAIN_ROT_COMPONENTS), newRotBase);
+        newMoments.rot_m2.set(params.rot_m2.slice(rotBase, rotBase + TRAIN_ROT_COMPONENTS), newRotBase);
+        newMoments.sh_m1.set(params.sh_m1.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+        newMoments.sh_m2.set(params.sh_m2.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+        writeIdx++;
+      }
+
+      for (let i = 0; i < active_count; i++) {
+        const action = actions[i];
+        if (action === 0) continue;
+        const posBase = i * TRAIN_POS_COMPONENTS;
+        const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+        const rotBase = i * TRAIN_ROT_COMPONENTS;
+        const shBase = i * TRAIN_SH_COMPONENTS;
+        const pos = [positions[posBase], positions[posBase + 1], positions[posBase + 2]];
+        const scale = [scales[scaleBase], scales[scaleBase + 1], scales[scaleBase + 2]];
+        const rot = [rotations[rotBase], rotations[rotBase + 1], rotations[rotBase + 2], rotations[rotBase + 3]];
+        const sigma = [Math.exp(scale[0]), Math.exp(scale[1]), Math.exp(scale[2])];
+        if (action === 1) {
+          const newPosBase = writeIdx * TRAIN_POS_COMPONENTS;
+          const newScaleBase = writeIdx * TRAIN_SCALE_COMPONENTS;
+          const newRotBase = writeIdx * TRAIN_ROT_COMPONENTS;
+          const newShBase = writeIdx * TRAIN_SH_COMPONENTS;
+          const jitterScale = Math.max(Math.exp(scale[0]), Math.exp(scale[1]), Math.exp(scale[2]));
+          const jitterMagnitude = jitterScale * 0.25 * (0.5 + Math.random() * 0.5);
+          const jitterDir = [
+            (Math.random() * 2 - 1),
+            (Math.random() * 2 - 1),
+            (Math.random() * 2 - 1),
+          ];
+          const norm = Math.hypot(jitterDir[0], jitterDir[1], jitterDir[2]) || 1.0;
+          const jitter = jitterDir.map((v) => (v / norm) * jitterMagnitude);
+          newPositions[newPosBase] = pos[0] + jitter[0];
+          newPositions[newPosBase + 1] = pos[1] + jitter[1];
+          newPositions[newPosBase + 2] = pos[2] + jitter[2];
+          newScales.set(scale, newScaleBase);
+          newRotations.set(rot, newRotBase);
+          newSHs.set(shs.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+          newOpacities[writeIdx] = opacities[i];
+          writeIdx++;
+        } else if (action === 2) {
+          const rotMat = quatToMat3(rot);
+          for (let s = 0; s < 2; s++) {
+            const localSample = sampleGaussian3D([0, 0, 0], sigma);
+            const worldOffset = [
+              rotMat[0][0] * localSample[0] + rotMat[0][1] * localSample[1] + rotMat[0][2] * localSample[2],
+              rotMat[1][0] * localSample[0] + rotMat[1][1] * localSample[1] + rotMat[1][2] * localSample[2],
+              rotMat[2][0] * localSample[0] + rotMat[2][1] * localSample[1] + rotMat[2][2] * localSample[2],
+            ];
+            const newPosBase = writeIdx * TRAIN_POS_COMPONENTS;
+            const newScaleBase = writeIdx * TRAIN_SCALE_COMPONENTS;
+            const newRotBase = writeIdx * TRAIN_ROT_COMPONENTS;
+            const newShBase = writeIdx * TRAIN_SH_COMPONENTS;
+            newPositions[newPosBase] = pos[0] + worldOffset[0];
+            newPositions[newPosBase + 1] = pos[1] + worldOffset[1];
+            newPositions[newPosBase + 2] = pos[2] + worldOffset[2];
+            const scaleReduction = Math.log(0.8 * 2.0);
+            newScales[newScaleBase] = scale[0] - scaleReduction;
+            newScales[newScaleBase + 1] = scale[1] - scaleReduction;
+            newScales[newScaleBase + 2] = scale[2] - scaleReduction;
+            newRotations.set(rot, newRotBase);
+            newSHs.set(shs.slice(shBase, shBase + TRAIN_SH_COMPONENTS), newShBase);
+            newOpacities[writeIdx] = opacities[i];
+            writeIdx++;
+          }
+        }
+      }
+
+      ensureCapacity(newCount);
+      device.queue.writeBuffer(train_position_buffer!, 0, newPositions);
+      device.queue.writeBuffer(train_scale_buffer!, 0, newScales);
+      device.queue.writeBuffer(train_rotation_buffer!, 0, newRotations);
+      device.queue.writeBuffer(train_opacity_buffer!, 0, newOpacities);
+      device.queue.writeBuffer(train_sh_buffer!, 0, newSHs);
+      writeAdamMoments(newMoments);
+      setActiveCount(newCount);
+      importanceManager?.ensureCapacity(newCount);
+      importanceManager?.resetStats(newCount);
+      importanceManager?.resetPruneActions(newCount);
+      await syncGaussianBufferFromTrainingParams();
+      rebuildAllBindGroups();
+      densificationManager.ensureCapacity(newCount);
+      densificationManager.resetAccumulators(newCount);
+      rebuildDensifyAccumBindGroup();
+      const pruned = await applyMultiViewPrune(multiView, prevCount);
+      console.log(`[densify] Completed: ${prevCount} -> ${active_count} gaussians (${cloneCount} cloned, ${splitCount} split, ${pruned} pruned)`);
+      await rebuildTilesForCurrentCamera();
+      return { cloned: cloneCount, split: splitCount };
+    } finally {
+      renderingSuspended = false;
+    }
+  }
+
+  /**
+   * Sync the main gaussian buffer and SH buffer from training parameter buffers
+   * This rebuilds the packed Float16 format used for rendering
+   */
+  async function syncGaussianBufferFromTrainingParams(): Promise<void> {
+    if (!train_position_buffer || !train_scale_buffer || !train_rotation_buffer ||
+      !train_opacity_buffer || !train_sh_buffer || !gaussian_buffer || !sh_buffer ||
+      active_count === 0) {
+      return;
+    }
+
+    // Read training params
+    const positions = await readBufferToCPU(train_position_buffer, active_count * TRAIN_POS_COMPONENTS * FLOAT32_BYTES);
+    const scales = await readBufferToCPU(train_scale_buffer, active_count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES);
+    const rotations = await readBufferToCPU(train_rotation_buffer, active_count * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES);
+    const opacities = await readBufferToCPU(train_opacity_buffer, active_count * FLOAT32_BYTES);
+    const shs = await readBufferToCPU(train_sh_buffer, active_count * TRAIN_SH_COMPONENTS * FLOAT32_BYTES);
+
+    // Import Float16Array for packing
+    const { Float16Array } = await import('@petamoriken/float16');
+
+    // Pack into gaussian buffer format
+    // Layout per gaussian: pos[3], opacity[1], rot[4], scale[4] = 12 float16s
+    const FLOATS_PER_GAUSSIAN = 12;
+    const packedData = new Float16Array(active_count * FLOATS_PER_GAUSSIAN);
+
+    for (let i = 0; i < active_count; i++) {
+      const outBase = i * FLOATS_PER_GAUSSIAN;
+      const posBase = i * TRAIN_POS_COMPONENTS;
+      const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+      const rotBase = i * TRAIN_ROT_COMPONENTS;
+
+      // Position (3)
+      packedData[outBase + 0] = positions[posBase + 0];
+      packedData[outBase + 1] = positions[posBase + 1];
+      packedData[outBase + 2] = positions[posBase + 2];
+
+      // Opacity (1)
+      packedData[outBase + 3] = opacities[i];
+
+      // Rotation (4)
+      packedData[outBase + 4] = rotations[rotBase + 0];
+      packedData[outBase + 5] = rotations[rotBase + 1];
+      packedData[outBase + 6] = rotations[rotBase + 2];
+      packedData[outBase + 7] = rotations[rotBase + 3];
+
+      // Scale (4) - stored as log-scale
+      packedData[outBase + 8] = scales[scaleBase + 0];
+      packedData[outBase + 9] = scales[scaleBase + 1];
+      packedData[outBase + 10] = scales[scaleBase + 2];
+      packedData[outBase + 11] = 0; // padding or unused
+    }
+
+    device.queue.writeBuffer(gaussian_buffer, 0, packedData.buffer);
+
+    // Pack SH buffer (Float32 -> Float16)
+    // SH buffer layout: 16 coeffs * 3 channels = 48 float16s per gaussian
+    // But stored as pairs in u32 (pack2x16float), so 24 u32s per gaussian
+    const SH_FLOATS_PER_GAUSSIAN = TRAIN_SH_COMPONENTS; // 48
+    const packedSH = new Float16Array(active_count * SH_FLOATS_PER_GAUSSIAN);
+
+    for (let i = 0; i < active_count; i++) {
+      const inBase = i * TRAIN_SH_COMPONENTS;
+      const outBase = i * SH_FLOATS_PER_GAUSSIAN;
+
+      for (let j = 0; j < TRAIN_SH_COMPONENTS; j++) {
+        packedSH[outBase + j] = shs[inBase + j];
+      }
+    }
+
+    device.queue.writeBuffer(sh_buffer, 0, packedSH.buffer);
+    await device.queue.onSubmittedWorkDone();
+  }
+
   function run_training_init_params(encoder: GPUCommandEncoder) {
     if (!training_init_params_bind_group) return;
     const num = active_count;
@@ -2298,1481 +3333,9 @@ export default function get_renderer(
     pass.end();
   }
 
-  // ===============================================
-  // Training
-  // ===============================================
-  async function debugDumpProjection(label: string = 'proj') : Promise<void> {
-    if (!debug_projection_buffer) {
-      console.warn('[debugDumpProjection] debug_projection_buffer is null.');
-      return;
-    }
-    if (active_count === 0) {
-      console.warn('[debugDumpProjection] No active gaussians.');
-      return;
-    }
-
-    if (!sorter || !preprocess_bg) {
-      console.warn('[debugDumpProjection] sorter or preprocess_bg not ready.');
-      return;
-    }
-
-    const encoder = device.createCommandEncoder();
-    run_preprocess(encoder);
-
-    const maxDebug = Math.min(active_count, 32);
-    const DEBUG_PROJ_STRIDE_BYTES = 2 * 4 * FLOAT32_BYTES;
-    const bytes = maxDebug * DEBUG_PROJ_STRIDE_BYTES;
-    const staging = device.createBuffer({
-      label: 'debug projection staging',
-      size: bytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-
-    encoder.copyBufferToBuffer(debug_projection_buffer, 0, staging, 0, bytes);
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-
-    await staging.mapAsync(GPUMapMode.READ);
-    const copy = staging.getMappedRange().slice(0);
-    staging.unmap();
-    staging.destroy();
-
-    const floats = new Float32Array(copy);
-    const perEntry = 8;
-    const entries: Array<{ idx: number; pos_cam: number[]; clip: number[] }> = [];
-    for (let i = 0; i < maxDebug; i++) {
-      const base = i * perEntry;
-      const pos_cam = Array.from(floats.subarray(base, base + 4));
-      const clip = Array.from(floats.subarray(base + 4, base + 8));
-      entries.push({ idx: i, pos_cam, clip });
-    }
-    console.log(`[debugDumpProjection] ${label} first ${maxDebug} gaussians:`, entries);
-  }
-  async function debugSampleTrainingState(label: string) {
-    const sampleCount = Math.min(active_count, 8);
-    if (active_count === 0) return;
-
-    if (!train_opacity_buffer || !grad_opacity_buffer || !grad_geom_buffer) {
-      return;
-    }
-
-    const sampleBytes = sampleCount * FLOAT32_BYTES;
-    const fullScalarBytes = active_count * FLOAT32_BYTES;
-
-    const scaleElements = active_count * TRAIN_SCALE_COMPONENTS;
-    const scaleBytes = scaleElements * FLOAT32_BYTES;
-
-    const shComponents = TRAIN_SH_COMPONENTS;
-    const shElements = active_count * shComponents;
-    const shBytes = shElements * FLOAT32_BYTES;
-
-    const encoder = device.createCommandEncoder();
-
-    const makeStaging = (dbgLabel: string, size: number) =>
-      device.createBuffer({
-        label: dbgLabel,
-        size,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-
-    const stTrainOpacity = makeStaging('debug train_opacity', sampleBytes);
-    const stGradOpacity = makeStaging('debug grad_opacity_full', fullScalarBytes);
-    const gradGeomBytes = active_count * GEOM_GRAD_COMPONENTS * FLOAT32_BYTES;
-    const stGradGeom = makeStaging('debug grad_geom_full', gradGeomBytes);
-
-    encoder.copyBufferToBuffer(train_opacity_buffer, 0, stTrainOpacity, 0, sampleBytes);
-    encoder.copyBufferToBuffer(grad_opacity_buffer, 0, stGradOpacity, 0, fullScalarBytes);
-    encoder.copyBufferToBuffer(grad_geom_buffer!, 0, stGradGeom, 0, gradGeomBytes);
-
-    let stTrainScale: GPUBuffer | null = null;
-    let stGradScale: GPUBuffer | null = null;
-    const haveScaleBuffers = !!train_scale_buffer && !!grad_scale_buffer && scaleElements > 0;
-    const haveShBuffers = !!train_sh_buffer && !!grad_sh_buffer && shElements > 0;
-    if (haveScaleBuffers) {
-      stTrainScale = makeStaging('debug train_scale_full', scaleBytes);
-      stGradScale = makeStaging('debug grad_scale_full', scaleBytes);
-      encoder.copyBufferToBuffer(train_scale_buffer!, 0, stTrainScale, 0, scaleBytes);
-      encoder.copyBufferToBuffer(grad_scale_buffer!, 0, stGradScale, 0, scaleBytes);
-    }
-
-    let stTrainSH: GPUBuffer | null = null;
-    let stGradSH: GPUBuffer | null = null;
-    if (haveShBuffers) {
-      stTrainSH = makeStaging('debug train_sh_full', shBytes);
-      stGradSH = makeStaging('debug grad_sh_full', shBytes);
-      encoder.copyBufferToBuffer(train_sh_buffer!, 0, stTrainSH, 0, shBytes);
-      encoder.copyBufferToBuffer(grad_sh_buffer!, 0, stGradSH, 0, shBytes);
-    }
-
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-
-    try {
-      // Map and log train_opacity slice
-      await stTrainOpacity.mapAsync(GPUMapMode.READ);
-      {
-        const copy = stTrainOpacity.getMappedRange().slice(0);
-        const arr = Array.from(new Float32Array(copy));
-        console.log(`[training debug] ${label} train_opacity[0:${sampleCount}] =`, arr);
-      }
-      stTrainOpacity.unmap();
-
-      // Map and analyze full grad_opacity
-      await stGradOpacity.mapAsync(GPUMapMode.READ);
-      const gradOpArrFull = new Float32Array(stGradOpacity.getMappedRange().slice(0));
-      stGradOpacity.unmap();
-
-      let nonZeroOp = 0;
-      let maxAbsOp = 0;
-      const examplesOp: Array<{ idx: number; v: number }> = [];
-      const nonZeroIndices: number[] = [];
-      for (let i = 0; i < active_count; i++) {
-        const v = gradOpArrFull[i];
-        if (v !== 0) {
-          nonZeroOp++;
-          nonZeroIndices.push(i);
-          const av = Math.abs(v);
-          if (av > maxAbsOp) maxAbsOp = av;
-          if (examplesOp.length < 5) {
-            examplesOp.push({ idx: i, v });
-          }
-        }
-      }
-      console.log(
-        `[training debug] ${label} grad_opacity stats: nonZero=${nonZeroOp}/${active_count}, maxAbs=${maxAbsOp}, examples=`,
-        examplesOp,
-      );
-      console.log(
-        `[training debug] ${label} grad_opacity[0:${sampleCount}] =`,
-        Array.from(gradOpArrFull.subarray(0, sampleCount)),
-      );
-      
-      if (nonZeroIndices.length > 0) {
-        const stTrainOpFull = makeStaging('debug train_opacity_full', fullScalarBytes);
-        const enc2 = device.createCommandEncoder();
-        enc2.copyBufferToBuffer(train_opacity_buffer, 0, stTrainOpFull, 0, fullScalarBytes);
-        device.queue.submit([enc2.finish()]);
-        await device.queue.onSubmittedWorkDone();
-        await stTrainOpFull.mapAsync(GPUMapMode.READ);
-        const trainOpFull = new Float32Array(stTrainOpFull.getMappedRange().slice(0));
-        stTrainOpFull.unmap();
-        stTrainOpFull.destroy();
-        
-        const samplesAtNonZero: Array<{ idx: number; train_op: number; grad_op: number }> = [];
-        for (let k = 0; k < Math.min(5, nonZeroIndices.length); k++) {
-          const idx = nonZeroIndices[k];
-          samplesAtNonZero.push({
-            idx,
-            train_op: trainOpFull[idx],
-            grad_op: gradOpArrFull[idx],
-          });
-        }
-        console.log(
-          `[training debug] ${label} train_opacity at non-zero grad indices =`,
-          samplesAtNonZero,
-        );
-      }
-
-      await stGradGeom.mapAsync(GPUMapMode.READ);
-      {
-        const geomArr = new Float32Array(stGradGeom.getMappedRange().slice(0));
-
-        let nonZeroConic = 0;
-        let nonZeroMean2d = 0;
-        let maxAbsConic = 0;
-        let maxAbsMean2d = 0;
-        const examplesGeom: Array<{ idx: number; conic: [number, number, number]; mean2d: [number, number] }> = [];
-
-        for (let i = 0; i < active_count; i++) {
-          const base = i * GEOM_GRAD_COMPONENTS;
-          const conic_a = geomArr[base + 0];
-          const conic_b = geomArr[base + 1];
-          const conic_c = geomArr[base + 2];
-          const mean2d_x = geomArr[base + 3];
-          const mean2d_y = geomArr[base + 4];
-
-          const conicMag = Math.abs(conic_a) + Math.abs(conic_b) + Math.abs(conic_c);
-          const mean2dMag = Math.abs(mean2d_x) + Math.abs(mean2d_y);
-
-          if (conicMag > 1e-10) {
-            nonZeroConic++;
-            maxAbsConic = Math.max(maxAbsConic, conicMag);
-          }
-          if (mean2dMag > 1e-10) {
-            nonZeroMean2d++;
-            maxAbsMean2d = Math.max(maxAbsMean2d, mean2dMag);
-          }
-
-          if (examplesGeom.length < 5 && (conicMag > 1e-10 || mean2dMag > 1e-10)) {
-            examplesGeom.push({
-              idx: i,
-              conic: [conic_a, conic_b, conic_c],
-              mean2d: [mean2d_x, mean2d_y],
-            });
-          }
-        }
-
-        console.log(
-          `[training debug] ${label} grad_geom stats: conic nonZero=${nonZeroConic}/${active_count} maxAbs=${maxAbsConic.toExponential(3)}, ` +
-          `mean2d nonZero=${nonZeroMean2d}/${active_count} maxAbs=${maxAbsMean2d.toExponential(3)}`,
-        );
-        console.log(
-          `[training debug] ${label} grad_geom examples =`,
-          examplesGeom.map(e => ({
-            idx: e.idx,
-            conic: e.conic.map(v => v.toExponential(2)),
-            mean2d: e.mean2d.map(v => v.toExponential(2)),
-          })),
-        );
-      }
-      stGradGeom.unmap();
-
-      if (haveScaleBuffers && stTrainScale && stGradScale) {
-        await stTrainScale.mapAsync(GPUMapMode.READ);
-        const scaleArr = new Float32Array(stTrainScale.getMappedRange().slice(0));
-        stTrainScale.unmap();
-
-        await stGradScale.mapAsync(GPUMapMode.READ);
-        const gradScaleArr = new Float32Array(stGradScale.getMappedRange().slice(0));
-        stGradScale.unmap();
-
-        const totalScaleEntries = active_count * TRAIN_SCALE_COMPONENTS;
-        let minLog = Number.POSITIVE_INFINITY;
-        let maxLog = Number.NEGATIVE_INFINITY;
-        let sumLog = 0;
-
-        let minSigma = Number.POSITIVE_INFINITY;
-        let maxSigma = Number.NEGATIVE_INFINITY;
-        let sumSigma = 0;
-
-        let maxAbsGradScale = 0;
-
-        for (let i = 0; i < active_count; i++) {
-          const base = i * TRAIN_SCALE_COMPONENTS;
-          for (let c = 0; c < TRAIN_SCALE_COMPONENTS; c++) {
-            const logv = scaleArr[base + c];
-            if (Number.isFinite(logv)) {
-              if (logv < minLog) minLog = logv;
-              if (logv > maxLog) maxLog = logv;
-              sumLog += logv;
-
-              const sigma = Math.exp(logv);
-              if (sigma < minSigma) minSigma = sigma;
-              if (sigma > maxSigma) maxSigma = sigma;
-              sumSigma += sigma;
-            }
-
-            const gv = gradScaleArr[base + c];
-            const ag = Math.abs(gv);
-            if (ag > maxAbsGradScale) maxAbsGradScale = ag;
-          }
-        }
-
-        const meanLog = totalScaleEntries > 0 ? sumLog / totalScaleEntries : 0;
-        const meanSigma = totalScaleEntries > 0 ? sumSigma / totalScaleEntries : 0;
-
-        console.log(
-          `[training debug] ${label} train_scale (log_sigma) stats: min=${minLog}, max=${maxLog}, mean=${meanLog}`,
-        );
-        console.log(
-          `[training debug] ${label} train_scale (sigma) stats: min=${minSigma}, max=${maxSigma}, mean=${meanSigma}`,
-        );
-        console.log(
-          `[training debug] ${label} grad_scale stats: maxAbs=${maxAbsGradScale}`,
-        );
-
-        const scaleSamples: Array<{ idx: number; log_sigma: number[]; sigma: number[] }> = [];
-        const gradScaleSamples: Array<{ idx: number; grad: number[] }> = [];
-        const sampleGauss = Math.min(sampleCount, active_count);
-        for (let i = 0; i < sampleGauss; i++) {
-          const base = i * TRAIN_SCALE_COMPONENTS;
-          const ls = [
-            scaleArr[base + 0],
-            scaleArr[base + 1],
-            scaleArr[base + 2],
-          ];
-          const sig = ls.map((v) => Math.exp(v));
-          scaleSamples.push({ idx: i, log_sigma: ls, sigma: sig });
-
-          const gs = [
-            gradScaleArr[base + 0],
-            gradScaleArr[base + 1],
-            gradScaleArr[base + 2],
-          ];
-          gradScaleSamples.push({ idx: i, grad: gs });
-        }
-        console.log(
-          `[training debug] ${label} train_scale[0:${sampleGauss}] (per-gaussian log_sigma, sigma) =`,
-          scaleSamples,
-        );
-        console.log(
-          `[training debug] ${label} grad_scale[0:${sampleGauss}] =`,
-          gradScaleSamples,
-        );
-        
-        const nonZeroScaleIndices: number[] = [];
-        for (let i = 0; i < active_count; i++) {
-          const base = i * TRAIN_SCALE_COMPONENTS;
-          if (gradScaleArr[base] !== 0 || gradScaleArr[base+1] !== 0 || gradScaleArr[base+2] !== 0) {
-            nonZeroScaleIndices.push(i);
-            if (nonZeroScaleIndices.length >= 10) break;
-          }
-        }
-        if (nonZeroScaleIndices.length > 0) {
-          const nonZeroScaleSamples: Array<{ idx: number; log_sigma: number[]; grad: number[] }> = [];
-          for (const idx of nonZeroScaleIndices) {
-            const base = idx * TRAIN_SCALE_COMPONENTS;
-            nonZeroScaleSamples.push({
-              idx,
-              log_sigma: [scaleArr[base], scaleArr[base+1], scaleArr[base+2]],
-              grad: [gradScaleArr[base], gradScaleArr[base+1], gradScaleArr[base+2]],
-            });
-          }
-          console.log(
-            `[training debug] ${label} train_scale at non-zero grad indices (${nonZeroScaleIndices.length} found) =`,
-            nonZeroScaleSamples,
-          );
-        }
-      }
-
-      if (haveShBuffers && stTrainSH && stGradSH) {
-        await stTrainSH.mapAsync(GPUMapMode.READ);
-        const shArr = new Float32Array(stTrainSH.getMappedRange().slice(0));
-        stTrainSH.unmap();
-
-        await stGradSH.mapAsync(GPUMapMode.READ);
-        const gradShArr = new Float32Array(stGradSH.getMappedRange().slice(0));
-        stGradSH.unmap();
-
-        const sampleGauss = Math.min(sampleCount, active_count);
-        const shSamples: Array<{ idx: number; dc: number[]; grad_dc: number[] }> = [];
-
-        for (let i = 0; i < sampleGauss; i++) {
-          const base = i * shComponents;
-          const dc = [
-            shArr[base + 0],
-            shArr[base + 1],
-            shArr[base + 2],
-          ];
-          const gdc = [
-            gradShArr[base + 0],
-            gradShArr[base + 1],
-            gradShArr[base + 2],
-          ];
-          shSamples.push({ idx: i, dc, grad_dc: gdc });
-        }
-
-        let maxAbsShGrad = 0;
-        for (let i = 0; i < active_count; i++) {
-          const base = i * shComponents;
-          const gx = Math.abs(gradShArr[base + 0]);
-          const gy = Math.abs(gradShArr[base + 1]);
-          const gz = Math.abs(gradShArr[base + 2]);
-          const gmax = Math.max(gx, gy, gz);
-          if (gmax > maxAbsShGrad) maxAbsShGrad = gmax;
-        }
-
-        console.log(
-          `[training debug] ${label} SH DC grad stats: maxAbs=${maxAbsShGrad}`,
-        );
-        console.log(
-          `[training debug] ${label} SH DC[0:${sampleGauss}] (value, grad) =`,
-          shSamples,
-        );
-      }
-    } finally {
-      stTrainOpacity.destroy();
-      stGradOpacity.destroy();
-      stGradGeom.destroy();
-      if (stTrainScale) stTrainScale.destroy();
-      if (stGradScale) stGradScale.destroy();
-      if (stTrainSH) stTrainSH.destroy();
-      if (stGradSH) stGradSH.destroy();
-    }
-  }
-
-  async function debugDumpSplatRadii(label: string) {
-    if (active_count === 0) {
-      console.warn('[debugDumpSplatRadii] No active gaussians.');
-      return;
-    }
-    if (!splat_buffer) {
-      console.warn('[debugDumpSplatRadii] splat_buffer is null.');
-      return;
-    }
-    if (!sorter || !preprocess_bg) {
-      console.warn('[debugDumpSplatRadii] sorter or preprocess_bg not ready.');
-      return;
-    }
-
-    const sampleCount = Math.min(active_count, 32);
-    const strideFloats = BYTES_PER_SPLAT / FLOAT32_BYTES;
-    const bytes = sampleCount * BYTES_PER_SPLAT;
-
-    const encoder = device.createCommandEncoder();
-    run_preprocess(encoder);
-
-    const staging = device.createBuffer({
-      label: 'debug splat radii staging',
-      size: bytes,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    encoder.copyBufferToBuffer(splat_buffer, 0, staging, 0, bytes);
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-
-    await staging.mapAsync(GPUMapMode.READ);
-    const copy = staging.getMappedRange().slice(0);
-    staging.unmap();
-    staging.destroy();
-
-    const floats = new Float32Array(copy);
-
-    let minR = Number.POSITIVE_INFINITY;
-    let maxR = Number.NEGATIVE_INFINITY;
-    let sumR = 0;
-    let count = 0;
-    const samples: Array<{ idx: number; center_ndc: number[]; radius: number[] }> = [];
-
-    for (let i = 0; i < sampleCount; i++) {
-      const base = i * strideFloats;
-      const center_ndc = [floats[base + 0], floats[base + 1]];
-      const radius = [floats[base + 2], floats[base + 3]];
-      const r = Math.max(radius[0], radius[1]);
-      if (Number.isFinite(r)) {
-        if (r < minR) minR = r;
-        if (r > maxR) maxR = r;
-        sumR += r;
-        count++;
-      }
-      if (samples.length < 16) {
-        samples.push({ idx: i, center_ndc, radius });
-      }
-    }
-
-    const meanR = count > 0 ? sumR / count : 0;
-    console.log(
-      `[training debug] ${label} splat radius sample stats (screen-space px): min=${minR}, max=${maxR}, mean=${meanR}, sampleCount=${count}`,
-    );
-    console.log(
-      `[training debug] ${label} splat radius samples[0:${samples.length}] =`,
-      samples,
-    );
-  }
-
-
-  async function collectGradientDiagnostics(): Promise<{
-    iteration: number;
-    activeCount: number;
-    shDeg: number;
-    cameraIndex: number;
-    gradStats: Record<string, {
-      nonZeroCount: number;
-      totalCount: number;
-      nonZeroPct: number;
-      mean: number;
-      max: number;
-      min: number;
-      std: number;
-    }>;
-    sampleSplats: Array<{
-      idx: number;
-      opacity: number;
-      gradOpacity: number;
-      gradAlphaSplat: number;
-      scale: number[];
-      gradScale: number[];
-      shDC: number[];
-      gradShDC: number[];
-    }>;
-  }> {
-    const result = {
-      iteration: trainingIteration,
-      activeCount: active_count,
-      shDeg: current_sh_degree,
-      cameraIndex: current_training_camera_index,
-      gradStats: {} as Record<string, any>,
-      sampleSplats: [] as any[],
-    };
-
-    if (active_count === 0) return result;
-
-    const makeStaging = (label: string, size: number) =>
-      device.createBuffer({
-        label,
-        size,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-
-    const computeStats = (arr: Float32Array | Int32Array, scale: number = 1.0) => {
-      let sum = 0, sumSq = 0, max = 0, min = Infinity, nonZeroCount = 0;
-      for (let i = 0; i < arr.length; i++) {
-        const v = (arr[i] as number) * scale;
-        const absV = Math.abs(v);
-        sum += v;
-        sumSq += v * v;
-        if (absV > max) max = absV;
-        if (absV < min) min = absV;
-        if (absV > 1e-15) nonZeroCount++;
-      }
-      const mean = arr.length > 0 ? sum / arr.length : 0;
-      const variance = arr.length > 0 ? (sumSq / arr.length) - (mean * mean) : 0;
-      return {
-        nonZeroCount,
-        totalCount: arr.length,
-        nonZeroPct: arr.length > 0 ? (100 * nonZeroCount / arr.length) : 0,
-        mean,
-        max,
-        min: min === Infinity ? 0 : min,
-        std: Math.sqrt(Math.max(0, variance)),
-      };
-    };
-
-    const encoder = device.createCommandEncoder();
-    const stagingBuffers: GPUBuffer[] = [];
-
-    const opacityBytes = active_count * FLOAT32_BYTES;
-    const geomGradBytes = active_count * GEOM_GRAD_COMPONENTS * FLOAT32_BYTES;
-    const scaleBytes = active_count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES;
-    const rotBytes = active_count * TRAIN_ROT_COMPONENTS * FLOAT32_BYTES;
-    const posBytes = active_count * TRAIN_POS_COMPONENTS * FLOAT32_BYTES;
-    const shBytes = active_count * TRAIN_SH_COMPONENTS * FLOAT32_BYTES;
-
-    const stGradOpacity = makeStaging('diag grad_opacity', opacityBytes);
-    const stGradGeom = makeStaging('diag grad_geom', geomGradBytes);
-    const stGradScale = makeStaging('diag grad_scale', scaleBytes);
-    const stGradRot = makeStaging('diag grad_rotation', rotBytes);
-    const stGradPos = makeStaging('diag grad_position', posBytes);
-    const stGradSH = makeStaging('diag grad_sh', shBytes);
-    const stTrainOpacity = makeStaging('diag train_opacity', opacityBytes);
-    const stTrainScale = makeStaging('diag train_scale', scaleBytes);
-    const stTrainSH = makeStaging('diag train_sh', shBytes);
-
-    stagingBuffers.push(stGradOpacity, stGradGeom, stGradScale, stGradRot, stGradPos, stGradSH,
-                        stTrainOpacity, stTrainScale, stTrainSH);
-
-    if (grad_opacity_buffer) encoder.copyBufferToBuffer(grad_opacity_buffer, 0, stGradOpacity, 0, opacityBytes);
-    if (grad_geom_buffer) encoder.copyBufferToBuffer(grad_geom_buffer, 0, stGradGeom, 0, geomGradBytes);
-    if (grad_scale_buffer) encoder.copyBufferToBuffer(grad_scale_buffer, 0, stGradScale, 0, scaleBytes);
-    if (grad_rotation_buffer) encoder.copyBufferToBuffer(grad_rotation_buffer, 0, stGradRot, 0, rotBytes);
-    if (grad_position_buffer) encoder.copyBufferToBuffer(grad_position_buffer, 0, stGradPos, 0, posBytes);
-    if (grad_sh_buffer) encoder.copyBufferToBuffer(grad_sh_buffer, 0, stGradSH, 0, shBytes);
-    if (train_opacity_buffer) encoder.copyBufferToBuffer(train_opacity_buffer, 0, stTrainOpacity, 0, opacityBytes);
-    if (train_scale_buffer) encoder.copyBufferToBuffer(train_scale_buffer, 0, stTrainScale, 0, scaleBytes);
-    if (train_sh_buffer) encoder.copyBufferToBuffer(train_sh_buffer, 0, stTrainSH, 0, shBytes);
-
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-
-    await stGradOpacity.mapAsync(GPUMapMode.READ);
-    const gradOpArr = new Float32Array(stGradOpacity.getMappedRange().slice(0));
-    stGradOpacity.unmap();
-    result.gradStats['opacity'] = computeStats(gradOpArr);
-
-    await stGradGeom.mapAsync(GPUMapMode.READ);
-    const gradGeomArr = new Float32Array(stGradGeom.getMappedRange().slice(0));
-    stGradGeom.unmap();
-    
-    const gradConicArr = new Float32Array(active_count * 3);
-    for (let i = 0; i < active_count; i++) {
-      gradConicArr[i * 3 + 0] = gradGeomArr[i * GEOM_GRAD_COMPONENTS + 0];
-      gradConicArr[i * 3 + 1] = gradGeomArr[i * GEOM_GRAD_COMPONENTS + 1];
-      gradConicArr[i * 3 + 2] = gradGeomArr[i * GEOM_GRAD_COMPONENTS + 2];
-    }
-    result.gradStats['conic'] = computeStats(gradConicArr);
-    
-    const gradMean2dArr = new Float32Array(active_count * 2);
-    for (let i = 0; i < active_count; i++) {
-      gradMean2dArr[i * 2 + 0] = gradGeomArr[i * GEOM_GRAD_COMPONENTS + 3];
-      gradMean2dArr[i * 2 + 1] = gradGeomArr[i * GEOM_GRAD_COMPONENTS + 4];
-    }
-    result.gradStats['mean2d'] = computeStats(gradMean2dArr);
-
-    await stGradScale.mapAsync(GPUMapMode.READ);
-    const gradScaleArr = new Float32Array(stGradScale.getMappedRange().slice(0));
-    stGradScale.unmap();
-    result.gradStats['scale'] = computeStats(gradScaleArr);
-
-    await stGradRot.mapAsync(GPUMapMode.READ);
-    const gradRotArr = new Float32Array(stGradRot.getMappedRange().slice(0));
-    stGradRot.unmap();
-    result.gradStats['rotation'] = computeStats(gradRotArr);
-
-    await stGradPos.mapAsync(GPUMapMode.READ);
-    const gradPosArr = new Float32Array(stGradPos.getMappedRange().slice(0));
-    stGradPos.unmap();
-    result.gradStats['position'] = computeStats(gradPosArr);
-
-    await stGradSH.mapAsync(GPUMapMode.READ);
-    const gradShArr = new Float32Array(stGradSH.getMappedRange().slice(0));
-    stGradSH.unmap();
-    const gradShDC = new Float32Array(active_count * 3);
-    const gradShHigher = new Float32Array(active_count * (TRAIN_SH_COMPONENTS - 3));
-    for (let i = 0; i < active_count; i++) {
-      const base = i * TRAIN_SH_COMPONENTS;
-      gradShDC[i * 3 + 0] = gradShArr[base + 0];
-      gradShDC[i * 3 + 1] = gradShArr[base + 1];
-      gradShDC[i * 3 + 2] = gradShArr[base + 2];
-      for (let j = 3; j < TRAIN_SH_COMPONENTS; j++) {
-        gradShHigher[i * (TRAIN_SH_COMPONENTS - 3) + (j - 3)] = gradShArr[base + j];
-      }
-    }
-    result.gradStats['sh_dc'] = computeStats(gradShDC);
-    result.gradStats['sh_higher'] = computeStats(gradShHigher);
-
-    await stTrainOpacity.mapAsync(GPUMapMode.READ);
-    const trainOpArr = new Float32Array(stTrainOpacity.getMappedRange().slice(0));
-    stTrainOpacity.unmap();
-
-    await stTrainScale.mapAsync(GPUMapMode.READ);
-    const trainScaleArr = new Float32Array(stTrainScale.getMappedRange().slice(0));
-    stTrainScale.unmap();
-
-    await stTrainSH.mapAsync(GPUMapMode.READ);
-    const trainShArr = new Float32Array(stTrainSH.getMappedRange().slice(0));
-    stTrainSH.unmap();
-
-    const sampleSize = Math.min(50, active_count);
-    const indices = new Set<number>();
-    
-    for (let i = 0; i < Math.min(10, active_count); i++) indices.add(i);
-    
-    while (indices.size < sampleSize / 2) {
-      indices.add(Math.floor(Math.random() * active_count));
-    }
-    
-    const geomGradMag: Array<[number, number]> = [];
-    for (let i = 0; i < active_count; i++) {
-      const geomBase = i * GEOM_GRAD_COMPONENTS;
-      const conicMag = Math.abs(gradGeomArr[geomBase + 0]) + Math.abs(gradGeomArr[geomBase + 1]) + Math.abs(gradGeomArr[geomBase + 2]);
-      geomGradMag.push([i, Math.abs(gradOpArr[i]) + conicMag]);
-    }
-    geomGradMag.sort((a, b) => b[1] - a[1]);
-    for (let i = 0; i < Math.min(sampleSize / 2, geomGradMag.length); i++) {
-      indices.add(geomGradMag[i][0]);
-    }
-
-    for (const idx of indices) {
-      const scaleBase = idx * TRAIN_SCALE_COMPONENTS;
-      const shBase = idx * TRAIN_SH_COMPONENTS;
-      const geomBase = idx * GEOM_GRAD_COMPONENTS;
-      result.sampleSplats.push({
-        idx,
-        opacity: trainOpArr[idx],
-        gradOpacity: gradOpArr[idx],
-        gradConic: [gradGeomArr[geomBase + 0], gradGeomArr[geomBase + 1], gradGeomArr[geomBase + 2]],
-        gradMean2d: [gradGeomArr[geomBase + 3], gradGeomArr[geomBase + 4]],
-        scale: [trainScaleArr[scaleBase], trainScaleArr[scaleBase + 1], trainScaleArr[scaleBase + 2]],
-        gradScale: [gradScaleArr[scaleBase], gradScaleArr[scaleBase + 1], gradScaleArr[scaleBase + 2]],
-        shDC: [trainShArr[shBase], trainShArr[shBase + 1], trainShArr[shBase + 2]],
-        gradShDC: [gradShArr[shBase], gradShArr[shBase + 1], gradShArr[shBase + 2]],
-      });
-    }
-
-    const conicMagOf = (s: any) => Math.abs(s.gradConic[0]) + Math.abs(s.gradConic[1]) + Math.abs(s.gradConic[2]);
-    result.sampleSplats.sort((a, b) => 
-      (Math.abs(b.gradOpacity) + conicMagOf(b)) - 
-      (Math.abs(a.gradOpacity) + conicMagOf(a))
-    );
-
-    for (const buf of stagingBuffers) buf.destroy();
-
-    return result;
-  }
-
-  function getTileCoverageStats() {
-    return lastTileCoverageStats;
-  }
-
-  async function tracePixelCompositing(pixelX: number, pixelY: number): Promise<{
-    pixel: { x: number; y: number };
-    tile: { id: number; x: number; y: number; start: number; end: number };
-    forwardTrace: Array<{
-      order: number;
-      splatIdx: number;
-      depth: number;
-      gaussianVal: number;
-      opacity: number;
-      alphaSplat: number;
-      color: [number, number, number];
-      accumAlpha: number;
-      accumColor: [number, number, number];
-      transmittance: number;
-    }>;
-    backwardTrace: Array<{
-      order: number;
-      splatIdx: number;
-      alphaSplat: number;
-      T_before: number;
-      accum_rec: [number, number, number];
-      dL_dalpha_formula: string;
-    }>;
-    finalColor: [number, number, number];
-    finalAlpha: number;
-    backgroundUsed: [number, number, number];
-    observation: string;
-  } | null> {
-    if (!tile_offsets_buffer || !flatten_ids_buffer || !gauss_projections_buffer || 
-        !gaussian_buffer || !lastTileCoverageStats) {
-      console.warn('[tracePixelCompositing] Required buffers not available');
-      return null;
-    }
-
-    const tileWidth = lastTileCoverageStats.tileWidth;
-    const tileHeight = lastTileCoverageStats.tileHeight;
-    const tileSize = TILE_SIZE;
-
-    const tileX = Math.floor(pixelX / tileSize);
-    const tileY = Math.floor(pixelY / tileSize);
-    if (tileX >= tileWidth || tileY >= tileHeight) {
-      console.warn('[tracePixelCompositing] Pixel outside tile grid');
-      return null;
-    }
-    const tileId = tileY * tileWidth + tileX;
-    const totalTiles = tileWidth * tileHeight;
-
-    const readBuffer = async (buf: GPUBuffer, size: number, name: string): Promise<ArrayBuffer> => {
-      const staging = device.createBuffer({
-        label: `trace staging ${name}`,
-        size,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      const enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(buf, 0, staging, 0, size);
-      device.queue.submit([enc.finish()]);
-      await device.queue.onSubmittedWorkDone();
-      await staging.mapAsync(GPUMapMode.READ);
-      const data = staging.getMappedRange().slice(0);
-      staging.unmap();
-      staging.destroy();
-      return data;
-    };
-
-    const offsetsData = await readBuffer(tile_offsets_buffer, (totalTiles + 1) * 4, 'tile_offsets');
-    const offsets = new Uint32Array(offsetsData);
-    const tileStart = offsets[tileId];
-    const tileEnd = offsets[tileId + 1];
-
-    if (tileStart >= tileEnd) {
-      return {
-        pixel: { x: pixelX, y: pixelY },
-        tile: { id: tileId, x: tileX, y: tileY, start: tileStart, end: tileEnd },
-        forwardTrace: [],
-        backwardTrace: [],
-        finalColor: [0, 0, 0],
-        finalAlpha: 0,
-        backgroundUsed: [0, 0, 0],
-        observation: 'Empty tile - no splats assigned',
-      };
-    }
-
-    const flattenData = await readBuffer(flatten_ids_buffer, lastTileCoverageStats.totalIntersections * 4, 'flatten_ids');
-    const flattenIds = new Uint32Array(flattenData);
-
-    // Read merged GaussProjection buffer and extract components
-    const projData = await readBuffer(gauss_projections_buffer, active_count * GAUSS_PROJECTION_BYTES, 'gauss_projections');
-    const projView = new DataView(projData);
-    
-    const means2d = new Float32Array(active_count * 2);
-    const conics = new Float32Array(active_count * 3);
-    const depths = new Float32Array(active_count);
-    for (let i = 0; i < active_count; i++) {
-      const base = i * GAUSS_PROJECTION_BYTES;
-      means2d[i * 2 + 0] = projView.getFloat32(base + 0, true);
-      means2d[i * 2 + 1] = projView.getFloat32(base + 4, true);
-      depths[i] = projView.getFloat32(base + 12, true);
-      conics[i * 3 + 0] = projView.getFloat32(base + 16, true);
-      conics[i * 3 + 1] = projView.getFloat32(base + 20, true);
-      conics[i * 3 + 2] = projView.getFloat32(base + 24, true);
-    }
-
-    const gaussianData = await readBuffer(gaussian_buffer, active_count * C_SIZE_3D_GAUSSIAN, 'gaussians');
-    const gaussians = new Uint16Array(gaussianData);
-
-    const f16ToF32 = (u16: number): number => {
-      const sign = (u16 >> 15) & 1;
-      const exp = (u16 >> 10) & 0x1f;
-      const frac = u16 & 0x3ff;
-      if (exp === 0) {
-        return (sign ? -1 : 1) * Math.pow(2, -14) * (frac / 1024);
-      } else if (exp === 31) {
-        return frac ? NaN : (sign ? -Infinity : Infinity);
-      }
-      return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + frac / 1024);
-    };
-
-    const getGaussianParams = (idx: number) => {
-      const stride = C_SIZE_3D_GAUSSIAN / 2;
-      const base = idx * stride;
-      const posX = f16ToF32(gaussians[base + 0]);
-      const posY = f16ToF32(gaussians[base + 1]);
-      const posZ = f16ToF32(gaussians[base + 2]);
-      const opacityLogit = f16ToF32(gaussians[base + 3]);
-
-      return {
-        position: [posX, posY, posZ] as [number, number, number],
-        opacityLogit,
-        opacity: 1 / (1 + Math.exp(-opacityLogit)),
-      };
-    };
-
-    const pixelCenter = [pixelX + 0.5, pixelY + 0.5];
-    const forwardTrace: Array<any> = [];
-    let accumColor: [number, number, number] = [0, 0, 0];
-    let accumAlpha = 0;
-
-    const MIN_ALPHA = 1 / 255;
-    const MAX_ALPHA = 0.999;
-    const T_THRESHOLD = 1e-4;
-
-    for (let i = tileStart; i < tileEnd; i++) {
-      const splatIdx = flattenIds[i];
-      const centerPx = [means2d[splatIdx * 2], means2d[splatIdx * 2 + 1]];
-      const a = conics[splatIdx * 3 + 0];
-      const b = conics[splatIdx * 3 + 1];
-      const c = conics[splatIdx * 3 + 2];
-      const depth = depths[splatIdx];
-
-      const dx = pixelCenter[0] - centerPx[0];
-      const dy = pixelCenter[1] - centerPx[1];
-      const sigmaOver2 = 0.5 * (a * dx * dx + c * dy * dy) + b * dx * dy;
-
-      if (sigmaOver2 < 0) continue;
-
-      const gaussianVal = Math.exp(-sigmaOver2);
-      const params = getGaussianParams(splatIdx);
-      const alphaLocal = params.opacity * gaussianVal;
-      const alphaSplat = Math.min(alphaLocal, MAX_ALPHA);
-
-      if (alphaSplat < MIN_ALPHA) continue;
-
-      const oneMinusAlpha = 1 - accumAlpha;
-      const contribAlpha = alphaSplat * oneMinusAlpha;
-
-      const approxColor: [number, number, number] = [0.5, 0.5, 0.5];
-
-      accumColor = [
-        accumColor[0] + approxColor[0] * contribAlpha,
-        accumColor[1] + approxColor[1] * contribAlpha,
-        accumColor[2] + approxColor[2] * contribAlpha,
-      ];
-      accumAlpha += contribAlpha;
-
-      forwardTrace.push({
-        order: forwardTrace.length,
-        splatIdx,
-        depth,
-        gaussianVal,
-        opacity: params.opacity,
-        alphaSplat,
-        color: approxColor,
-        accumAlpha,
-        accumColor: [...accumColor] as [number, number, number],
-        transmittance: 1 - accumAlpha,
-      });
-
-      if (1 - accumAlpha < T_THRESHOLD) break;
-    }
-
-    const backwardTrace: Array<any> = [];
-    const bgColor: [number, number, number] = [0, 0, 0];
-    
-    let T_current = 1 - accumAlpha;
-    let accum_rec: [number, number, number] = [...bgColor];
-    
-    for (let j = forwardTrace.length - 1; j >= 0; j--) {
-      const entry = forwardTrace[j];
-      const alphaSplat = entry.alphaSplat;
-      
-      const oneMinusAlpha = Math.max(1 - alphaSplat, 0.0001);
-      const T_before = T_current / oneMinusAlpha;
-      
-      backwardTrace.push({
-        order: forwardTrace.length - 1 - j,
-        splatIdx: entry.splatIdx,
-        alphaSplat,
-        T_before,
-        accum_rec: [...accum_rec] as [number, number, number],
-        dL_dalpha_formula: `(color - accum_rec) * T_before = (color - [${accum_rec.map(c => c.toFixed(3)).join(',')}]) * ${T_before.toFixed(4)}`,
-      });
-      
-      const color = entry.color;
-      accum_rec = [
-        alphaSplat * color[0] + (1 - alphaSplat) * accum_rec[0],
-        alphaSplat * color[1] + (1 - alphaSplat) * accum_rec[1],
-        alphaSplat * color[2] + (1 - alphaSplat) * accum_rec[2],
-      ];
-      
-      T_current = T_before;
-    }
-
-    const T = 1 - accumAlpha;
-    const finalColor: [number, number, number] = [
-      accumColor[0] + T * bgColor[0],
-      accumColor[1] + T * bgColor[1],
-      accumColor[2] + T * bgColor[2],
-    ];
-
-    let observation = '';
-    if (forwardTrace.length === 0) {
-      observation = 'No splats contribute to this pixel.';
-    } else {
-      observation = `${forwardTrace.length} splats contribute. ` +
-        `BACKWARD TRAVERSAL IS NOW BACK-TO-FRONT (indices ${forwardTrace[forwardTrace.length-1]?.splatIdx} → ${forwardTrace[0]?.splatIdx}). ` +
-        `Uses accum_rec (accumulated color from behind) instead of fixed background. ` +
-        `This matches FastGS behavior for correct gradient computation.`;
-    }
-
-    return {
-      pixel: { x: pixelX, y: pixelY },
-      tile: { id: tileId, x: tileX, y: tileY, start: tileStart, end: tileEnd },
-      forwardTrace,
-      backwardTrace,
-      finalColor,
-      finalAlpha: accumAlpha,
-      backgroundUsed: bgColor,
-      observation,
-    };
-  }
-
-  async function computePerTileStats(): Promise<{
-    nonEmptyTiles: number;
-    minSplatsPerTile: number;
-    maxSplatsPerTile: number;
-    avgSplatsPerTile: number;
-    maxSplatsTileId: number;
-    maxSplatsTileX: number;
-    maxSplatsTileY: number;
-  } | null> {
-    if (!tile_offsets_buffer || !lastTileCoverageStats) return null;
-    
-    const totalTiles = lastTileCoverageStats.totalTiles;
-    const tileWidth = lastTileCoverageStats.tileWidth;
-    const bufferSize = (totalTiles + 1) * 4;
-    
-    const staging = device.createBuffer({
-      label: 'tile_offsets staging for debug',
-      size: bufferSize,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    
-    const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(tile_offsets_buffer, 0, staging, 0, bufferSize);
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    
-    await staging.mapAsync(GPUMapMode.READ);
-    const offsets = new Uint32Array(staging.getMappedRange().slice(0));
-    staging.unmap();
-    staging.destroy();
-    
-    let nonEmptyTiles = 0;
-    let minSplats = Infinity;
-    let maxSplats = 0;
-    let totalSplats = 0;
-    let maxSplatsTileId = -1;
-    
-    for (let t = 0; t < totalTiles; t++) {
-      const start = offsets[t];
-      const end = offsets[t + 1];
-      const count = end - start;
-      if (count > 0) {
-        nonEmptyTiles++;
-        totalSplats += count;
-        if (count < minSplats) minSplats = count;
-        if (count > maxSplats) {
-          maxSplats = count;
-          maxSplatsTileId = t;
-        }
-      }
-    }
-    
-    return {
-      nonEmptyTiles,
-      minSplatsPerTile: nonEmptyTiles > 0 ? minSplats : 0,
-      maxSplatsPerTile: maxSplats,
-      avgSplatsPerTile: nonEmptyTiles > 0 ? totalSplats / nonEmptyTiles : 0,
-      maxSplatsTileId,
-      maxSplatsTileX: maxSplatsTileId >= 0 ? maxSplatsTileId % tileWidth : -1,
-      maxSplatsTileY: maxSplatsTileId >= 0 ? Math.floor(maxSplatsTileId / tileWidth) : -1,
-    };
-  }
-
-  async function debugTileDuplication(): Promise<{
-    tiles: Array<{
-      tileId: number;
-      tileX: number;
-      tileY: number;
-      numEntries: number;
-      numUnique: number;
-      duplicationFactor: number;
-      firstIndices: number[];
-    }>;
-    suggestedDebugPixel: { x: number; y: number; tileId: number } | null;
-  } | null> {
-    if (!tile_offsets_buffer || !flatten_ids_buffer || !lastTileCoverageStats) {
-      console.warn('[debugTileDuplication] Required buffers not available');
-      return null;
-    }
-
-    const totalTiles = lastTileCoverageStats.totalTiles;
-    const tileWidth = lastTileCoverageStats.tileWidth;
-    const tileSize = TILE_SIZE;
-
-    const offsetsStaging = device.createBuffer({
-      label: 'tile_offsets staging for dup check',
-      size: (totalTiles + 1) * 4,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const enc1 = device.createCommandEncoder();
-    enc1.copyBufferToBuffer(tile_offsets_buffer, 0, offsetsStaging, 0, (totalTiles + 1) * 4);
-    device.queue.submit([enc1.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    await offsetsStaging.mapAsync(GPUMapMode.READ);
-    const offsets = new Uint32Array(offsetsStaging.getMappedRange().slice(0));
-    offsetsStaging.unmap();
-    offsetsStaging.destroy();
-
-    const tilesToAnalyze: Array<{ tileId: number; start: number; end: number }> = [];
-    let maxSplatsTile = -1;
-    let maxSplatsCount = 0;
-    const nonEmptyTileIds: number[] = [];
-
-    for (let t = 0; t < totalTiles; t++) {
-      const start = offsets[t];
-      const end = offsets[t + 1];
-      const count = end - start;
-      if (count > 0) {
-        nonEmptyTileIds.push(t);
-        if (count > maxSplatsCount) {
-          maxSplatsCount = count;
-          maxSplatsTile = t;
-        }
-      }
-    }
-
-    if (maxSplatsTile >= 0) {
-      tilesToAnalyze.push({
-        tileId: maxSplatsTile,
-        start: offsets[maxSplatsTile],
-        end: offsets[maxSplatsTile + 1],
-      });
-    }
-
-    const otherTiles = nonEmptyTileIds.filter(t => t !== maxSplatsTile);
-    for (let i = 0; i < Math.min(2, otherTiles.length); i++) {
-      const randIdx = Math.floor(Math.random() * otherTiles.length);
-      const tileId = otherTiles.splice(randIdx, 1)[0];
-      tilesToAnalyze.push({
-        tileId,
-        start: offsets[tileId],
-        end: offsets[tileId + 1],
-      });
-    }
-
-    if (tilesToAnalyze.length === 0) {
-      return { tiles: [], suggestedDebugPixel: null };
-    }
-
-    const totalIntersections = lastTileCoverageStats.totalIntersections;
-    const flattenStaging = device.createBuffer({
-      label: 'flatten_ids staging for dup check',
-      size: totalIntersections * 4,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-    const enc2 = device.createCommandEncoder();
-    enc2.copyBufferToBuffer(flatten_ids_buffer, 0, flattenStaging, 0, totalIntersections * 4);
-    device.queue.submit([enc2.finish()]);
-    await device.queue.onSubmittedWorkDone();
-    await flattenStaging.mapAsync(GPUMapMode.READ);
-    const flattenIds = new Uint32Array(flattenStaging.getMappedRange().slice(0));
-    flattenStaging.unmap();
-    flattenStaging.destroy();
-
-    const results: Array<any> = [];
-    let suggestedTile: { tileId: number; tileX: number; tileY: number } | null = null;
-
-    for (const tile of tilesToAnalyze) {
-      const numEntries = tile.end - tile.start;
-      const indices = new Set<number>();
-      const firstIndices: number[] = [];
-
-      for (let i = tile.start; i < tile.end; i++) {
-        const idx = flattenIds[i];
-        indices.add(idx);
-        if (firstIndices.length < 10) {
-          firstIndices.push(idx);
-        }
-      }
-
-      const numUnique = indices.size;
-      const duplicationFactor = numUnique > 0 ? numEntries / numUnique : 0;
-      const tileX = tile.tileId % tileWidth;
-      const tileY = Math.floor(tile.tileId / tileWidth);
-
-      results.push({
-        tileId: tile.tileId,
-        tileX,
-        tileY,
-        numEntries,
-        numUnique,
-        duplicationFactor,
-        firstIndices,
-      });
-
-      if (!suggestedTile && numUnique >= 5 && numUnique <= 200) {
-        suggestedTile = { tileId: tile.tileId, tileX, tileY };
-      }
-    }
-
-    if (!suggestedTile && results.length > 0) {
-      const best = results.reduce((a, b) => 
-        (a.numUnique > 0 && a.numUnique < b.numUnique) ? a : b
-      );
-      suggestedTile = { tileId: best.tileId, tileX: best.tileX, tileY: best.tileY };
-    }
-
-    const suggestedDebugPixel = suggestedTile ? {
-      x: Math.floor((suggestedTile.tileX + 0.5) * tileSize),
-      y: Math.floor((suggestedTile.tileY + 0.5) * tileSize),
-      tileId: suggestedTile.tileId,
-    } : null;
-
-    return { tiles: results, suggestedDebugPixel };
-  }
-
-  async function debugInspectTileKeys(): Promise<{
-    totalIntersections: number;
-    firstKeys: Array<{ idx: number; key: number; tileId: number; depth: number; gaussIdx: number }>;
-    tileIdDistribution: Map<number, number>;
-    sortedCorrectly: boolean;
-    issues: string[];
-  } | null> {
-    if (!isect_ids_buffer || !flatten_ids_buffer || !lastTileCoverageStats) {
-      return null;
-    }
-
-    const totalIntersections = lastTileCoverageStats.totalIntersections;
-    if (totalIntersections === 0) {
-      return { totalIntersections: 0, firstKeys: [], tileIdDistribution: new Map(), sortedCorrectly: true, issues: [] };
-    }
-
-    const readBuffer = async (buf: GPUBuffer, size: number): Promise<ArrayBuffer> => {
-      const staging = device.createBuffer({
-        label: 'key debug staging',
-        size,
-        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      });
-      const enc = device.createCommandEncoder();
-      enc.copyBufferToBuffer(buf, 0, staging, 0, size);
-      device.queue.submit([enc.finish()]);
-      await device.queue.onSubmittedWorkDone();
-      await staging.mapAsync(GPUMapMode.READ);
-      const data = staging.getMappedRange().slice(0);
-      staging.unmap();
-      staging.destroy();
-      return data;
-    };
-
-    const isectData = await readBuffer(isect_ids_buffer, totalIntersections * 4);
-    const isectIds = new Uint32Array(isectData);
-
-    const flattenData = await readBuffer(flatten_ids_buffer, totalIntersections * 4);
-    const flattenIds = new Uint32Array(flattenData);
-
-    const TILE_BITS = 12;
-    const DEPTH_BITS = 16;
-    const TILE_SHIFT = DEPTH_BITS;
-    const TILE_MASK = (1 << TILE_BITS) - 1;
-    const DEPTH_MASK = (1 << DEPTH_BITS) - 1;
-
-    const decodeKey = (key: number) => {
-      const depth = key & DEPTH_MASK;
-      const tileAndCam = key >> TILE_SHIFT;
-      const tileId = tileAndCam & TILE_MASK;
-      return { tileId, depth };
-    };
-
-    const firstKeys: Array<any> = [];
-    const tileIdDistribution = new Map<number, number>();
-    let sortedCorrectly = true;
-    let prevKey = 0;
-    const issues: string[] = [];
-
-    for (let i = 0; i < totalIntersections; i++) {
-      const key = isectIds[i];
-      const { tileId, depth } = decodeKey(key);
-      const gaussIdx = flattenIds[i];
-
-      tileIdDistribution.set(tileId, (tileIdDistribution.get(tileId) || 0) + 1);
-
-      if (i > 0 && key < prevKey) {
-        sortedCorrectly = false;
-        if (issues.length < 5) {
-          issues.push(`Sort violation at index ${i}: key ${key} < prev ${prevKey}`);
-        }
-      }
-      prevKey = key;
-
-      if (i < 20) {
-        firstKeys.push({ idx: i, key, tileId, depth, gaussIdx });
-      }
-    }
-
-    const tileWidth = lastTileCoverageStats.tileWidth;
-    const tileHeight = lastTileCoverageStats.tileHeight;
-    const maxValidTileId = tileWidth * tileHeight - 1;
-
-    let invalidTileCount = 0;
-    for (const [tileId, count] of tileIdDistribution) {
-      if (tileId > maxValidTileId) {
-        invalidTileCount += count;
-        if (issues.length < 10) {
-          issues.push(`Invalid tileId ${tileId} (max valid: ${maxValidTileId}) with ${count} entries`);
-        }
-      }
-    }
-
-    if (invalidTileCount > 0) {
-      issues.push(`Total entries with invalid tileId: ${invalidTileCount}`);
-    }
-
-    const tile0Count = tileIdDistribution.get(0) || 0;
-    if (tile0Count > totalIntersections * 0.9) {
-      issues.push(`WARNING: ${tile0Count}/${totalIntersections} (${(100*tile0Count/totalIntersections).toFixed(1)}%) entries are in tile 0!`);
-    }
-
-    return { totalIntersections, firstKeys, tileIdDistribution, sortedCorrectly, issues };
-  }
-
-  async function debugTrainWithDiagnostics(): Promise<void> {
-    console.log('\n========================================');
-    console.log('TRAINING DIAGNOSTICS');
-    console.log('========================================\n');
-
-    const nextCameraIndex = training_camera_buffers.length > 0
-      ? trainingIteration % training_camera_buffers.length
-      : 0;
-
-    if (!tilesBuilt || tilesBuiltForCameraIndex !== nextCameraIndex) {
-      current_training_camera_index = nextCameraIndex;
-      console.log(`Building tiles for camera ${nextCameraIndex}...`);
-      await buildTileIntersections();
-      tilesBuiltForCameraIndex = nextCameraIndex;
-    }
-
-    if (!tilesBuilt) {
-      console.error('Failed to build tiles');
-      return;
-    }
-
-    console.log('--- Tile Coverage Stats ---');
-    const tileStats = getTileCoverageStats();
-    if (tileStats) {
-      console.log(`  Total gaussians: ${active_count}`);
-      console.log(`  Frustum pass (assigned to tiles): ${tileStats.numFrustumPass} (${(100 * tileStats.numFrustumPass / active_count).toFixed(2)}%)`);
-      console.log(`  Total (gaussian, tile) intersections: ${tileStats.totalIntersections}`);
-      console.log(`  Avg tiles per visible splat: ${tileStats.avgTilesPerSplat.toFixed(2)}`);
-      console.log(`  Max tiles for single splat: ${tileStats.maxTilesPerSplat}`);
-      console.log(`  Tile grid: ${tileStats.tileWidth} x ${tileStats.tileHeight} = ${tileStats.totalTiles} tiles`);
-    }
-    
-    const perTileStats = await computePerTileStats();
-    if (perTileStats) {
-      console.log(`  Non-empty tiles: ${perTileStats.nonEmptyTiles} (${(100 * perTileStats.nonEmptyTiles / (tileStats?.totalTiles || 1)).toFixed(2)}%)`);
-      console.log(`  Splats per non-empty tile: min=${perTileStats.minSplatsPerTile}, max=${perTileStats.maxSplatsPerTile}, avg=${perTileStats.avgSplatsPerTile.toFixed(2)}`);
-      if (perTileStats.maxSplatsTileId >= 0) {
-        console.log(`  Max-splats tile: id=${perTileStats.maxSplatsTileId} at (${perTileStats.maxSplatsTileX}, ${perTileStats.maxSplatsTileY})`);
-      }
-    }
-    console.log('');
-
-    console.log('--- Tile Duplication Analysis ---');
-    const tileDupStats = await debugTileDuplication();
-    if (tileDupStats) {
-      for (const t of tileDupStats.tiles) {
-        const dupWarning = t.duplicationFactor > 1.1 ? ' ⚠️ DUPLICATES!' : '';
-        console.log(`  Tile ${t.tileId} (${t.tileX}, ${t.tileY}): entries=${t.numEntries}, unique=${t.numUnique}, dupFactor=${t.duplicationFactor.toFixed(2)}${dupWarning}`);
-        console.log(`    First 10 indices: [${t.firstIndices.join(', ')}]`);
-      }
-      if (tileDupStats.suggestedDebugPixel) {
-        const sp = tileDupStats.suggestedDebugPixel;
-        console.log('');
-        console.log(`  ✓ Suggested debug pixel: (${sp.x}, ${sp.y}) in tile ${sp.tileId}`);
-        console.log(`    Run: gaussian_renderer.debugTracePixel(${sp.x}, ${sp.y})`);
-      }
-    }
-    console.log('');
-
-    console.log('--- Intersection Key Analysis ---');
-    const keyAnalysis = await debugInspectTileKeys();
-    if (keyAnalysis) {
-      console.log(`  Total intersections: ${keyAnalysis.totalIntersections}`);
-      console.log(`  Sorted correctly: ${keyAnalysis.sortedCorrectly ? '✓ YES' : '✗ NO'}`);
-      console.log(`  Unique tile IDs: ${keyAnalysis.tileIdDistribution.size}`);
-      
-      const sortedTiles = [...keyAnalysis.tileIdDistribution.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5);
-      console.log('  Top 5 tiles by entry count:');
-      for (const [tileId, count] of sortedTiles) {
-        const tileX = tileId % (tileStats?.tileWidth || 1);
-        const tileY = Math.floor(tileId / (tileStats?.tileWidth || 1));
-        console.log(`    Tile ${tileId} (${tileX}, ${tileY}): ${count} entries`);
-      }
-
-      if (keyAnalysis.issues.length > 0) {
-        console.log('  ⚠️ ISSUES DETECTED:');
-        for (const issue of keyAnalysis.issues) {
-          console.log(`    - ${issue}`);
-        }
-      }
-
-      console.log('  First 10 keys (after sort):');
-      for (const k of keyAnalysis.firstKeys.slice(0, 10)) {
-        console.log(`    [${k.idx}] key=${k.key}, tileId=${k.tileId}, depth=${k.depth}, gaussIdx=${k.gaussIdx}`);
-      }
-    }
-    console.log('');
-
-    const encoder = device.createCommandEncoder();
-    trainStep(encoder);
-    device.queue.submit([encoder.finish()]);
-    await device.queue.onSubmittedWorkDone();
-
-    const diag = await collectGradientDiagnostics();
-
-    console.log(`Iteration: ${diag.iteration}`);
-    console.log(`Active splats: ${diag.activeCount}`);
-    console.log(`SH degree: ${diag.shDeg}`);
-    console.log(`Camera index: ${diag.cameraIndex}`);
-    console.log('');
-    console.log('--- Gradient Statistics ---');
-    
-    for (const [name, stats] of Object.entries(diag.gradStats)) {
-      const s = stats as any;
-      console.log(
-        `${name.padEnd(12)}: nonzero=${s.nonZeroPct.toFixed(1)}% (${s.nonZeroCount}/${s.totalCount}), ` +
-        `mean=${s.mean.toExponential(2)}, max=${s.max.toExponential(2)}, std=${s.std.toExponential(2)}`
-      );
-    }
-
-    console.log('');
-    console.log('--- Top 10 splats by gradient magnitude ---');
-    for (const s of diag.sampleSplats.slice(0, 10)) {
-      const sig = s.scale.map((v: number) => Math.exp(v).toFixed(4));
-      console.log(
-        `#${s.idx}: op=${(1/(1+Math.exp(-s.opacity))).toFixed(3)}, ` +
-        `gradOp=${s.gradOpacity.toExponential(2)}, gradAlpha=${s.gradAlphaSplat.toExponential(2)}, ` +
-        `sigma=[${sig.join(',')}], dc=[${s.shDC.map((v: number) => v.toFixed(3)).join(',')}]`
-      );
-    }
-
-    console.log('');
-    console.log('--- Bottom 10 splats (lowest gradients) ---');
-    for (const s of diag.sampleSplats.slice(-10).reverse()) {
-      const sig = s.scale.map((v: number) => Math.exp(v).toFixed(4));
-      console.log(
-        `#${s.idx}: op=${(1/(1+Math.exp(-s.opacity))).toFixed(3)}, ` +
-        `gradOp=${s.gradOpacity.toExponential(2)}, gradAlpha=${s.gradAlphaSplat.toExponential(2)}, ` +
-        `sigma=[${sig.join(',')}], dc=[${s.shDC.map((v: number) => v.toFixed(3)).join(',')}]`
-      );
-    }
-
-    const fullDiag = {
-      ...diag,
-      tileCoverage: tileStats,
-      perTileStats,
-      tileDuplication: tileDupStats,
-      keyAnalysis: keyAnalysis ? {
-        sortedCorrectly: keyAnalysis.sortedCorrectly,
-        uniqueTileIds: keyAnalysis.tileIdDistribution.size,
-        issues: keyAnalysis.issues,
-        firstKeys: keyAnalysis.firstKeys,
-      } : null,
-    };
-
-    console.log('');
-    console.log('Full diagnostics object available via: window._lastTrainingDiag');
-    console.log('');
-    console.log('To trace a specific pixel, run:');
-    console.log('  gaussian_renderer.tracePixelCompositing(x, y).then(t => console.log(JSON.stringify(t, null, 2)))');
-    console.log('Or use the helper:');
-    console.log('  gaussian_renderer.debugTracePixel(x, y)');
-    (window as any)._lastTrainingDiag = fullDiag;
-  }
-
-  async function debugTracePixel(pixelX: number, pixelY: number): Promise<void> {
-    console.log(`\n=== Pixel Trace (${pixelX}, ${pixelY}) ===\n`);
-    
-    const trace = await tracePixelCompositing(pixelX, pixelY);
-    if (!trace) {
-      console.log('Failed to trace pixel - tiles may not be built');
-      return;
-    }
-
-    console.log(`Tile: ${trace.tile.x}, ${trace.tile.y} (id=${trace.tile.id})`);
-    console.log(`Tile range in flatten_ids: [${trace.tile.start}, ${trace.tile.end}) = ${trace.tile.end - trace.tile.start} entries`);
-    console.log(`Splats that actually contribute: ${trace.forwardTrace.length}`);
-    console.log('');
-
-    if (trace.forwardTrace.length === 0) {
-      console.log('No splats contribute to this pixel.');
-      console.log(`Final color: [${trace.finalColor.map(c => c.toFixed(4)).join(', ')}] (background only)`);
-      return;
-    }
-
-    console.log('--- Forward Compositing Trace ---');
-    console.log('Order | SplatIdx | Depth    | Gaussian | Opacity | AlphaSplat | AccumAlpha | Transmittance');
-    console.log('------|----------|----------|----------|---------|------------|------------|-------------');
-    for (const entry of trace.forwardTrace) {
-      console.log(
-        `${String(entry.order).padStart(5)} | ` +
-        `${String(entry.splatIdx).padStart(8)} | ` +
-        `${entry.depth.toFixed(4).padStart(8)} | ` +
-        `${entry.gaussianVal.toFixed(4).padStart(8)} | ` +
-        `${entry.opacity.toFixed(3).padStart(7)} | ` +
-        `${entry.alphaSplat.toFixed(4).padStart(10)} | ` +
-        `${entry.accumAlpha.toFixed(4).padStart(10)} | ` +
-        `${entry.transmittance.toFixed(4).padStart(11)}`
-      );
-    }
-    console.log('');
-
-    console.log('--- Backward Traversal (BACK-TO-FRONT with accum_rec) ---');
-    console.log('Order | SplatIdx | AlphaSplat | T_before   | accum_rec');
-    console.log('------|----------|------------|------------|------------------');
-    for (const entry of trace.backwardTrace) {
-      const accumRecStr = entry.accum_rec ? 
-        `[${entry.accum_rec.map((c: number) => c.toFixed(3)).join(',')}]` : 
-        '[N/A]';
-      console.log(
-        `${String(entry.order).padStart(5)} | ` +
-        `${String(entry.splatIdx).padStart(8)} | ` +
-        `${entry.alphaSplat.toFixed(4).padStart(10)} | ` +
-        `${(entry.T_before || 0).toFixed(4).padStart(10)} | ` +
-        `${accumRecStr}`
-      );
-    }
-    console.log('');
-    console.log('Formula: dL/dalpha = (color - accum_rec) * T_before');
-    console.log('');
-
-    console.log(`Final alpha: ${trace.finalAlpha.toFixed(4)}`);
-    console.log(`Final color: [${trace.finalColor.map(c => c.toFixed(4)).join(', ')}]`);
-    console.log(`Background: [${trace.backgroundUsed.map(c => c.toFixed(4)).join(', ')}]`);
-    console.log('');
-    console.log('OBSERVATION:');
-    console.log(trace.observation);
-    console.log('');
-
-    (window as any)._lastPixelTrace = trace;
-    console.log('Full trace object available via: window._lastPixelTrace');
-  }
-
   function zeroGradBuffers() {
     if (!grad_sh_buffer || !grad_opacity_buffer ||
-        !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer) return;
+      !grad_position_buffer || !grad_scale_buffer || !grad_rotation_buffer) return;
     const sh_elements = capacity * TRAIN_SH_COMPONENTS;
     const opacity_elements = capacity;
     const pos_elements = capacity * TRAIN_POS_COMPONENTS;
@@ -3813,9 +3376,9 @@ export default function get_renderer(
   }
 
   function trainStep(encoder: GPUCommandEncoder) {
-    if (training_camera_buffers.length > 0) {
-      current_training_camera_index = trainingIteration % training_camera_buffers.length;
-    }
+    // NOTE: current_training_camera_index should be set by the caller before calling trainStep
+    // This allows proper coordination with tile building which also needs the camera index
+    // All callers (train(), profiledTrainStep(), etc.) now use random selection
 
     trainingIteration++;
 
@@ -3828,6 +3391,11 @@ export default function get_renderer(
     run_training_loss(encoder);
     run_training_tiled_backward(encoder);
     run_training_backward_geom(encoder);
+
+    // Update visibility/importance stats and accumulate gradients before Adam modifies them
+    run_importance_accumulate(encoder);
+    run_densify_accumulate(encoder);
+
     run_adam_updates(encoder);
     rebuildTrainingApplyParamsBG();
     run_training_apply_params(encoder);
@@ -3836,8 +3404,9 @@ export default function get_renderer(
   }
 
   async function profiledTrainStep(): Promise<void> {
+    // Random camera selection (like FastGS) instead of cycling
     if (training_camera_buffers.length > 0) {
-      current_training_camera_index = trainingIteration % training_camera_buffers.length;
+      current_training_camera_index = Math.floor(Math.random() * training_camera_buffers.length);
     }
 
     const stats = lastTileCoverageStats;
@@ -3888,6 +3457,8 @@ export default function get_renderer(
     {
       const encoder = device.createCommandEncoder();
       run_training_backward_geom(encoder);
+      run_importance_accumulate(encoder);
+      run_densify_accumulate(encoder);
       device.queue.submit([encoder.finish()]);
     }
     await profiler.endPass('backward_geom');
@@ -3922,17 +3493,30 @@ export default function get_renderer(
     }
 
     isTraining = true;
-    const startTime = performance.now();
-    let lastLogTime = startTime;
-    
+    stopTrainingRequested = false;
+    trainingTargetIterations = numIterations;
+    trainingStartTime = performance.now();
+    trainingIterationsCompleted = 0;
+
+    let lastLogTime = trainingStartTime;
+
     try {
       for (let i = 0; i < numIterations; i++) {
+        // Check for stop request
+        if (stopTrainingRequested) {
+          break;
+        }
+
+        // Random camera selection (like FastGS) instead of cycling
+        // This prevents bias from sequential camera ordering patterns
         const nextCameraIndex = training_camera_buffers.length > 0
-          ? (trainingIteration % training_camera_buffers.length)
+          ? Math.floor(Math.random() * training_camera_buffers.length)
           : 0;
-        
+
+        // Always set the camera index for this iteration
+        current_training_camera_index = nextCameraIndex;
+
         if (!tilesBuilt || tilesBuiltForCameraIndex !== nextCameraIndex) {
-          current_training_camera_index = nextCameraIndex;
           try {
             await buildTileIntersections();
             tilesBuiltForCameraIndex = nextCameraIndex;
@@ -3949,69 +3533,300 @@ export default function get_renderer(
         const encoder = device.createCommandEncoder();
         trainStep(encoder);
         device.queue.submit([encoder.finish()]);
-        
+
+        trainingIterationsCompleted = i + 1;
+
+        // Update training controller iteration (after trainStep incremented it)
+        if (trainingController) {
+          trainingController.setIteration(trainingIteration);
+        }
+
+        // Check if we should densify (clone/split based on accumulated gradients)
+        if (trainingController && trainingController.shouldDensify()) {
+          await device.queue.onSubmittedWorkDone();
+          const result = await performDensification();
+          if (result.cloned > 0 || result.split > 0) {
+            // Tiles need to be rebuilt after densification
+            tilesBuilt = false;
+            tilesBuiltForCameraIndex = -1;
+          }
+        }
+
+        // Check if we should prune (based on FastGS schedule)
+        if (trainingController && trainingController.shouldPrune()) {
+          await device.queue.onSubmittedWorkDone();
+          const prevCount = active_count;
+          await prune();
+          if (active_count !== prevCount) {
+            // Tiles need to be rebuilt after pruning
+            tilesBuilt = false;
+            tilesBuiltForCameraIndex = -1;
+          }
+        }
+
+        // Check if we should reset opacity (helps break floater dominance)
+        if (trainingController && trainingController.shouldResetOpacity()) {
+          await device.queue.onSubmittedWorkDone();
+          await resetOpacity(trainingController.getOpacityResetValue());
+        }
+
         if ((i + 1) % 10 === 0) {
           await device.queue.onSubmittedWorkDone();
-          
+
           const now = performance.now();
           if ((i + 1) % 50 === 0 || (now - lastLogTime) > 5000) {
-            const elapsed = (now - startTime) / 1000;
+            const elapsed = (now - trainingStartTime) / 1000;
             const iterPerSec = (i + 1) / elapsed;
-            console.log(`[train] Iteration ${i + 1}/${numIterations} (${iterPerSec.toFixed(1)} iter/s)`);
             lastLogTime = now;
           }
-          
+
           await new Promise<void>((resolve) => {
             requestAnimationFrame(() => resolve());
           });
         }
       }
-      
+
       await device.queue.onSubmittedWorkDone();
-      const totalTime = (performance.now() - startTime) / 1000;
-      console.log(`[train] Completed ${numIterations} iterations in ${totalTime.toFixed(1)}s (${(numIterations/totalTime).toFixed(1)} iter/s)`);
-      
+      const totalTime = (performance.now() - trainingStartTime) / 1000;
+
     } finally {
       isTraining = false;
+      stopTrainingRequested = false;
+      camera.needsPreprocess = true;
     }
   }
 
-  async function debugTrainOnce(label: string = 'debugTrainOnce') : Promise<void> {
-    if (active_count === 0) {
-      console.warn('[debugTrainOnce] No active gaussians.');
-      return;
+  function stopTraining() {
+    if (isTraining) {
+      stopTrainingRequested = true;
+      console.log('[train] Stop requested...');
     }
+  }
 
-    const nextCameraIndex = training_camera_buffers.length > 0
-      ? trainingIteration % training_camera_buffers.length
-      : 0;
+  // ===============================================
+  // Opacity Reset (for breaking floater dominance)
+  // ===============================================
 
-    if (!tilesBuilt || tilesBuiltForCameraIndex !== nextCameraIndex) {
-      current_training_camera_index = nextCameraIndex;
-      
-      console.log(`[debugTrainOnce] Building training tiles for camera ${nextCameraIndex}...`);
-      try {
-        await buildTileIntersections();
-        tilesBuiltForCameraIndex = nextCameraIndex;
-      } catch (err) {
-        console.error('[debugTrainOnce] Error while building tiles:', err);
-        return;
-      }
-      if (!tilesBuilt) {
-        console.warn('[debugTrainOnce] Tiles failed to build; aborting debug step.');
-        return;
-      }
-    }
+  /**
+   * Reset all opacity values to a maximum cap (like FastGS).
+   * This allows splats that were blocked by floaters to "compete" again.
+   * FastGS does this every 3000 iterations with a cap of 0.01 (1%).
+   * We use 10% since we don't have densification to add new splats.
+   * 
+   * CRITICAL: Also resets Adam momentum for opacity, scale, AND rotation
+   * to prevent old momentum from driving continued floater growth.
+   */
+  async function resetOpacity(maxOpacity: number = 0.1): Promise<void> {
+    if (!train_opacity_buffer || active_count === 0) return;
 
-    console.log(`[debugTrainOnce] Starting debug training step at iteration=${trainingIteration + 1}, active_count=${active_count}, camera=${nextCameraIndex}`);
+    // Convert opacity to logit: logit(p) = log(p / (1-p))
+    const maxLogit = Math.log(maxOpacity / (1 - maxOpacity));
+
+    // Read current opacity values
+    const opacityBytes = active_count * FLOAT32_BYTES;
+    const stagingRead = device.createBuffer({
+      label: 'opacity reset staging read',
+      size: opacityBytes,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
 
     const encoder = device.createCommandEncoder();
-    trainStep(encoder);
+    encoder.copyBufferToBuffer(train_opacity_buffer, 0, stagingRead, 0, opacityBytes);
     device.queue.submit([encoder.finish()]);
     await device.queue.onSubmittedWorkDone();
 
-    await debugSampleTrainingState(label + ` (iter ${trainingIteration})`);
-    await debugDumpSplatRadii(label + ` (iter ${trainingIteration})`);
+    await stagingRead.mapAsync(GPUMapMode.READ);
+    const opacityData = new Float32Array(stagingRead.getMappedRange().slice(0));
+    stagingRead.unmap();
+    stagingRead.destroy();
+
+    // Clamp opacity logits to maxLogit
+    let numClamped = 0;
+    for (let i = 0; i < active_count; i++) {
+      if (opacityData[i] > maxLogit) {
+        opacityData[i] = maxLogit;
+        numClamped++;
+      }
+    }
+
+    // Write back clamped values
+    device.queue.writeBuffer(train_opacity_buffer, 0, opacityData);
+
+    // CRITICAL: We do NOT reset Adam moments anymore, per alignment with FastGS.
+    // Resetting them caused issues where splats lost their "velocity" and couldn't recover.
+    // FastGS only modifies the opacity value itself.
+
+    await device.queue.onSubmittedWorkDone();
+
+    console.log(`[opacity reset] Capped ${numClamped}/${active_count} gaussians to max opacity ${(maxOpacity * 100).toFixed(1)}%`);
+  }
+
+  // ===============================================
+  // Training Parameter Controls
+  // ===============================================
+  function getTrainingParams(): TrainingParams {
+    return {
+      lr_means: MEANS_LR,
+      lr_sh: SHS_LR,
+      lr_opacity: OPACITY_LR,
+      lr_scale: SCALING_LR,
+      lr_rotation: ROTATION_LR,
+      sh_update_interval: SH_UPDATE_INTERVAL,
+    };
+  }
+
+  function setTrainingParams(params: Partial<TrainingParams>): void {
+    if (params.lr_means !== undefined) MEANS_LR = params.lr_means;
+    if (params.lr_sh !== undefined) SHS_LR = params.lr_sh;
+    if (params.lr_opacity !== undefined) OPACITY_LR = params.lr_opacity;
+    if (params.lr_scale !== undefined) SCALING_LR = params.lr_scale;
+    if (params.lr_rotation !== undefined) ROTATION_LR = params.lr_rotation;
+    if (params.sh_update_interval !== undefined) SH_UPDATE_INTERVAL = params.sh_update_interval;
+    console.log(`[Training Params] means=${MEANS_LR}, sh=${SHS_LR}, opacity=${OPACITY_LR}, scale=${SCALING_LR}, rotation=${ROTATION_LR}, sh_interval=${SH_UPDATE_INTERVAL}`);
+  }
+
+  function getTrainingStatus(): TrainingStatus {
+    const elapsed = isTraining ? (performance.now() - trainingStartTime) / 1000 : 0;
+    const iterPerSec = elapsed > 0 ? trainingIterationsCompleted / elapsed : 0;
+
+    return {
+      isTraining,
+      currentIteration: trainingIteration,
+      targetIterations: trainingTargetIterations,
+      iterationsPerSecond: iterPerSec,
+      gaussianCount: active_count,
+    };
+  }
+
+  function getGaussianCount(): number {
+    return active_count;
+  }
+
+  // Diagnostic function to check gradient and parameter statistics
+  async function dumpTrainingDiagnostics(): Promise<void> {
+    if (!train_scale_buffer || !grad_scale_buffer || !train_opacity_buffer || !grad_opacity_buffer) {
+      console.log('[Diagnostics] Buffers not ready');
+      return;
+    }
+
+    await device.queue.onSubmittedWorkDone();
+
+    // Read scale params and grads
+    const scaleSize = active_count * 3 * 4;
+    const opacitySize = active_count * 4;
+
+    const scaleStaging = device.createBuffer({
+      size: scaleSize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const gradScaleStaging = device.createBuffer({
+      size: scaleSize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const opacityStaging = device.createBuffer({
+      size: opacitySize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const gradOpacityStaging = device.createBuffer({
+      size: opacitySize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(train_scale_buffer, 0, scaleStaging, 0, scaleSize);
+    encoder.copyBufferToBuffer(grad_scale_buffer, 0, gradScaleStaging, 0, scaleSize);
+    encoder.copyBufferToBuffer(train_opacity_buffer, 0, opacityStaging, 0, opacitySize);
+    encoder.copyBufferToBuffer(grad_opacity_buffer, 0, gradOpacityStaging, 0, opacitySize);
+    device.queue.submit([encoder.finish()]);
+    await device.queue.onSubmittedWorkDone();
+
+    await scaleStaging.mapAsync(GPUMapMode.READ);
+    await gradScaleStaging.mapAsync(GPUMapMode.READ);
+    await opacityStaging.mapAsync(GPUMapMode.READ);
+    await gradOpacityStaging.mapAsync(GPUMapMode.READ);
+
+    const scaleData = new Float32Array(scaleStaging.getMappedRange().slice(0));
+    const gradScaleData = new Float32Array(gradScaleStaging.getMappedRange().slice(0));
+    const opacityData = new Float32Array(opacityStaging.getMappedRange().slice(0));
+    const gradOpacityData = new Float32Array(gradOpacityStaging.getMappedRange().slice(0));
+
+    scaleStaging.unmap();
+    gradScaleStaging.unmap();
+    opacityStaging.unmap();
+    gradOpacityStaging.unmap();
+    scaleStaging.destroy();
+    gradScaleStaging.destroy();
+    opacityStaging.destroy();
+    gradOpacityStaging.destroy();
+
+    // Compute statistics
+    let scaleMin = Infinity, scaleMax = -Infinity, scaleSum = 0;
+    let gradScaleMin = Infinity, gradScaleMax = -Infinity, gradScaleSum = 0, gradScaleNonZero = 0;
+    let opacityMin = Infinity, opacityMax = -Infinity;
+    let gradOpacityMin = Infinity, gradOpacityMax = -Infinity, gradOpacityNonZero = 0;
+
+    for (let i = 0; i < scaleData.length; i++) {
+      const v = scaleData[i];
+      scaleMin = Math.min(scaleMin, v);
+      scaleMax = Math.max(scaleMax, v);
+      scaleSum += v;
+
+      const gv = gradScaleData[i];
+      if (Math.abs(gv) > 1e-10) {
+        gradScaleMin = Math.min(gradScaleMin, gv);
+        gradScaleMax = Math.max(gradScaleMax, gv);
+        gradScaleSum += gv;
+        gradScaleNonZero++;
+      }
+    }
+
+    for (let i = 0; i < opacityData.length; i++) {
+      const v = opacityData[i];
+      opacityMin = Math.min(opacityMin, v);
+      opacityMax = Math.max(opacityMax, v);
+
+      const gv = gradOpacityData[i];
+      if (Math.abs(gv) > 1e-10) {
+        gradOpacityMin = Math.min(gradOpacityMin, gv);
+        gradOpacityMax = Math.max(gradOpacityMax, gv);
+        gradOpacityNonZero++;
+      }
+    }
+
+    console.log('========== TRAINING DIAGNOSTICS ==========');
+    console.log(`Iteration: ${trainingIteration}, Active Gaussians: ${active_count}`);
+    console.log(`Scale (log-sigma): min=${scaleMin.toFixed(4)}, max=${scaleMax.toFixed(4)}, mean=${(scaleSum / scaleData.length).toFixed(4)}`);
+    console.log(`Scale Grad: nonzero=${gradScaleNonZero}/${scaleData.length}, min=${gradScaleMin.toFixed(6)}, max=${gradScaleMax.toFixed(6)}`);
+    console.log(`Opacity (logit): min=${opacityMin.toFixed(4)}, max=${opacityMax.toFixed(4)}`);
+    console.log(`Opacity Grad: nonzero=${gradOpacityNonZero}/${opacityData.length}, min=${gradOpacityMin.toFixed(6)}, max=${gradOpacityMax.toFixed(6)}`);
+    console.log(`Current LRs: scale=${SCALING_LR}, opacity=${OPACITY_LR}, sh=${SHS_LR}`);
+    console.log(`Loss weights: L2=${currentLossWeights.w_l2}, L1=${currentLossWeights.w_l1}, SSIM=${currentLossWeights.w_ssim}`);
+    console.log('===========================================');
+  }
+
+  // Loss weight storage
+  let currentLossWeights: LossWeights = { w_l2: 0.2, w_l1: 0.8, w_ssim: 0.0 };
+
+  function getLossWeights(): LossWeights {
+    return { ...currentLossWeights };
+  }
+
+  function setLossWeights(weights: Partial<LossWeights>): void {
+    if (weights.w_l2 !== undefined) currentLossWeights.w_l2 = weights.w_l2;
+    if (weights.w_l1 !== undefined) currentLossWeights.w_l1 = weights.w_l1;
+    if (weights.w_ssim !== undefined) currentLossWeights.w_ssim = weights.w_ssim;
+
+    // Update the GPU buffer
+    if (loss_params_buffer) {
+      const data = new Float32Array([
+        currentLossWeights.w_l2,
+        currentLossWeights.w_l1,
+        currentLossWeights.w_ssim,
+        0.0,
+      ]);
+      device.queue.writeBuffer(loss_params_buffer, 0, data);
+      console.log(`[Loss Weights] L2=${currentLossWeights.w_l2.toFixed(2)}, L1=${currentLossWeights.w_l1.toFixed(2)}, SSIM=${currentLossWeights.w_ssim.toFixed(2)}`);
+    }
   }
 
   // ===============================================
@@ -4026,19 +3841,19 @@ export default function get_renderer(
     for (const buffer of training_camera_buffers) {
       buffer.destroy();
     }
-    
+
     training_cameras = cameras;
-    training_camera_buffers = cameras.map(cam => 
+    training_camera_buffers = cameras.map(cam =>
       create_training_camera_uniform_buffer(device, cam)
     );
-    
+
     current_training_camera_index = 0;
     console.log(`Loaded ${cameras.length} training cameras`);
   }
 
   function setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>) {
     training_images = images;
-    
+
     console.log(`Loaded ${images.length} training images`);
     if (training_cameras.length > 0 && images.length !== training_cameras.length) {
       console.warn(`Image count (${images.length}) doesn't match camera count (${training_cameras.length}). Some cameras may not have matching images.`);
@@ -4050,6 +3865,9 @@ export default function get_renderer(
   // ===============================================
   return {
     frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => {
+      if (renderingSuspended) {
+        return;
+      }
       if (camera.needsPreprocess) {
         run_preprocess(encoder);
         if (sorter) {
@@ -4067,19 +3885,26 @@ export default function get_renderer(
     initializeKnn,
     initializeKnnAndSync,
     prune,
-    densify,
+    resetOpacity,
     setTrainingCameras,
     setTrainingImages,
-    debugTrainOnce,
-    debugDumpProjection,
-    debugTrainWithDiagnostics,
-    collectGradientDiagnostics,
-    tracePixelCompositing,
-    debugTracePixel,
-    getTileCoverageStats,
     buildTrainingTiles: buildTileIntersections,
     enableProfiling: (enabled: boolean) => profiler.setEnabled(enabled),
     printProfilingReport: () => profiler.printReport(),
     profiledTrainStep,
+    // Training controller access
+    getTrainingController: () => trainingController,
+    getSceneExtent: () => sceneExtent,
+    // Training parameter controls
+    getTrainingParams,
+    setTrainingParams,
+    getTrainingStatus,
+    getGaussianCount,
+    stopTraining,
+    // Loss weight controls
+    getLossWeights,
+    setLossWeights,
+    // Diagnostics
+    dumpTrainingDiagnostics,
   };
 }
