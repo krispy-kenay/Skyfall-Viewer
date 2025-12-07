@@ -5,6 +5,8 @@ import { loadColmapDatasetScene as loadColmapSceneInternal } from './colmap-data
 export interface TrainingImageResource {
   view: GPUTextureView;
   sampler: GPUSampler;
+  width: number;
+  height: number;
 }
 
 export interface SceneDataset {

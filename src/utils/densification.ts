@@ -17,16 +17,18 @@ export interface DensificationConfig {
   gradAbsThreshold: number;   // Split if avg abs gradient norm >= this (default: 0.0012)
   denseSizeRatio: number;     // Size threshold = scene_extent * this (default: 0.001)
   minVisibility: number;      // Require at least this many visible frames before densifying
+  importanceThreshold: number; // Require this avg importance before densifying
   
   // After densification, cap opacity at this value
   postDensifyOpacityCap: number;  // Default: 0.8
 }
 
 export const DEFAULT_DENSIFICATION_CONFIG: DensificationConfig = {
-  gradThreshold: 0.002,
-  gradAbsThreshold: 0.012,
+  gradThreshold: 0.003,
+  gradAbsThreshold: 0.015,
   denseSizeRatio: 0.001,
-  minVisibility: 15,
+  minVisibility: 25,
+  importanceThreshold: 1.5,
   postDensifyOpacityCap: 0.8,
 };
 
@@ -193,7 +195,7 @@ export class DensificationManager {
       this.config.postDensifyOpacityCap,
       gaussianCount,
       this.config.minVisibility,
-      0,
+      this.config.importanceThreshold,
       0,
     ]);
   }

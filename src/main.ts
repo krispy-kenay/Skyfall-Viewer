@@ -18,13 +18,21 @@ import { assert } from './utils/util';
     return;
   }
   
+  console.log('WebGPU Adapter Limits:');
+  console.log(`  maxBufferSize: ${(adapter.limits.maxBufferSize / (1024 * 1024)).toFixed(0)} MB`);
+  console.log(`  maxStorageBufferBindingSize: ${(adapter.limits.maxStorageBufferBindingSize / (1024 * 1024)).toFixed(0)} MB`);
+  console.log(`  maxStorageBuffersPerShaderStage: ${adapter.limits.maxStorageBuffersPerShaderStage}`);
+  
   const device = await adapter.requestDevice({
     requiredLimits: {
       maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
       maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
       maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage,
+      maxBufferSize: adapter.limits.maxBufferSize,
     },
   });
+  
+  console.log(`  Requested maxBufferSize: ${(device.limits.maxBufferSize / (1024 * 1024)).toFixed(0)} MB`);
 
   const canvas = document.querySelector<HTMLCanvasElement>('#webgpu-canvas');
   assert(canvas !== null);

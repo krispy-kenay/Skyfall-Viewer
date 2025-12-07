@@ -50,7 +50,7 @@ export function createPointCloudFromXYZRGB(
   });
   const sh = new Float16Array(sh_buffer.getMappedRange());
 
-  const defaultOpacity = 1.0;
+  const defaultOpacity = -2.197;
   const defaultSigma = 0.01;
   const defaultScale = Math.log(defaultSigma);
   const defaultRot = [0, 0, 0, 1];

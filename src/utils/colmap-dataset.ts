@@ -65,6 +65,8 @@ async function loadImageToTextureFromDir(
       addressModeU: 'clamp-to-edge',
       addressModeV: 'clamp-to-edge',
     }),
+    width: imageBitmap.width,
+    height: imageBitmap.height,
   };
 }
 
@@ -322,5 +324,4 @@ export async function loadColmapDatasetScene(
     trainingImages,
   };
 }
-
 

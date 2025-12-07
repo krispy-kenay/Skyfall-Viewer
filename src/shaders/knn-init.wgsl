@@ -1,3 +1,10 @@
+struct KnnInitParams {
+    scene_extent : f32,
+    min_sigma_ratio : f32,
+    max_sigma_ratio : f32,
+    bias_sigma_ratio : f32,
+};
+
 @group(0) @binding(0)
 var<storage, read_write> gaussians : array<Gaussian>;
 
@@ -6,6 +13,9 @@ var<uniform> num_points : u32;
 
 @group(0) @binding(2)
 var<storage, read_write> density_buffer : array<f32>;
+
+@group(0) @binding(3)
+var<uniform> knn_params : KnnInitParams;
 
 fn read_position(idx: u32) -> vec3<f32> {
     let g = gaussians[idx];
@@ -53,12 +63,17 @@ fn knn_init(@builtin(global_invocation_id) gid : vec3<u32>) {
         insert_sorted(&nearest_dists, dist);
     }
     let mean_dist = (nearest_dists[0u] + nearest_dists[1u] + nearest_dists[2u]) / 3.0;
-    
     density_buffer[idx] = mean_dist;
-    
+
     let MAX_INITIAL_SIGMA = 0.1;
-    let initial_sigma = min(mean_dist / 3.0, MAX_INITIAL_SIGMA);
-    let log_sigma = log(max(initial_sigma, 1e-6));
+    let base_sigma = mean_dist / 3.0;
+    let min_sigma = knn_params.scene_extent * knn_params.min_sigma_ratio;
+    let max_sigma = knn_params.scene_extent * knn_params.max_sigma_ratio;
+    let bias_sigma = knn_params.scene_extent * knn_params.bias_sigma_ratio;
+    var sigma = max(base_sigma, bias_sigma);
+    sigma = clamp(sigma, min_sigma, max_sigma);
+    sigma = min(sigma, MAX_INITIAL_SIGMA);
+    let log_sigma = log(max(sigma, 1e-6));
     
     var g = gaussians[idx];
     var s01 = unpack2x16float(g.scale[0u]);
@@ -73,4 +88,3 @@ fn knn_init(@builtin(global_invocation_id) gid : vec3<u32>) {
     
     gaussians[idx] = g;
 }
-

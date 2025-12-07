@@ -212,12 +212,12 @@ function get_scatter_histogram_sizes(keysize: number) {
   const count_ru_histo = histo_blocks_ru * histo_block_kvs;
 
   return {
-      scatter_block_kvs,
-      scatter_blocks_ru,
-      count_ru_scatter,
-      histo_block_kvs,
-      histo_blocks_ru,
-      count_ru_histo,
+    scatter_block_kvs,
+    scatter_blocks_ru,
+    count_ru_scatter,
+    histo_block_kvs,
+    histo_blocks_ru,
+    count_ru_histo,
   };
 }
 
@@ -340,7 +340,7 @@ export function get_sorter(keysize: number, device: GPUDevice): SortStuff {
     pass.setBindGroup(0, bind_group);
 
     // assert: passes == 4
-    
+
     pass.setPipeline(pipelines.scatter_even);
     pass.dispatchWorkgroupsIndirect(sort_dispatch_indirect_buffer, 0);
     pass.setPipeline(pipelines.scatter_odd);

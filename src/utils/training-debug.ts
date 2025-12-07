@@ -50,6 +50,7 @@ export interface TrainingDebugReport {
     gradPosition: [number, number, number];
     gradScale: [number, number, number];
     gradOpacity: number;
+    gradAlphaSplat: number;
     gradShDC: [number, number, number];
     gradConic: [number, number, number];
     gradMean2d: [number, number];
@@ -183,4 +184,3 @@ export function downloadDebugReport(report: TrainingDebugReport): void {
   a.click();
   URL.revokeObjectURL(url);
 }
-

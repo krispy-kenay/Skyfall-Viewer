@@ -1,4 +1,6 @@
+import { mat4, vec2 } from 'wgpu-matrix';
 import { PointCloud } from '../utils/load';
+import type { TrainingImageResource } from '../utils/dataset-loader';
 import preprocessWGSL from '../shaders/preprocess.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import commonWGSL from '../shaders/common.wgsl';
@@ -15,11 +17,11 @@ import adamWGSL from '../shaders/adam.wgsl';
 import metricWGSL from '../shaders/metric-map.wgsl';
 import { get_sorter, C } from '../sort/sort';
 import { Renderer } from './renderer';
-import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer } from '../camera/camera';
+import { Camera, TrainingCameraData, create_training_camera_uniform_buffer, update_training_camera_uniform_buffer, get_pinhole_projection_matrix, principal_point_to_ndc } from '../camera/camera';
 import { TrainingProfiler, setGlobalProfiler } from '../utils/training-profiler';
 import { TrainingController, PruneParams, DEFAULT_TRAINING_SCHEDULE } from '../utils/training-controller';
 import { DensificationManager, GRAD_ACCUM_STRIDE, GRAD_ACCUM_X, GRAD_ACCUM_ABS, GRAD_ACCUM_DENOM } from '../utils/densification';
-import { ImportanceManager } from '../utils/importance';
+import { ImportanceManager, IMPORTANCE_STATS_STRIDE } from '../utils/importance';
 import densifyAccumWGSL from '../shaders/densify-accum.wgsl';
 import densifyDecideWGSL from '../shaders/densify-decide.wgsl';
 import importanceAccumWGSL from '../shaders/importance-accum.wgsl';
@@ -36,7 +38,7 @@ export interface GaussianRenderer extends Renderer {
   prune(customParams?: PruneParams): Promise<number>;
   resetOpacity(maxOpacity?: number): Promise<void>;
   setTrainingCameras(cameras: TrainingCameraData[]): void;
-  setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>): void;
+  setTrainingImages(images: TrainingImageResource[]): void;
   buildTrainingTiles(): Promise<void>;
   enableProfiling?(enabled: boolean): void;
   printProfilingReport?(): void;
@@ -67,22 +69,31 @@ const DENSIFY_INTERVAL = 100;
 const MULTI_VIEW_SAMPLE_COUNT = 10;
 const MULTI_VIEW_LOSS_THRESH = 0.1;
 const MULTI_VIEW_IMPORTANCE_THRESHOLD = 5;
+const MULTI_VIEW_PRUNE_RATIO = 0.5;
+const MULTI_VIEW_PRUNE_MAX_RATIO = 0.02;
+const MULTI_VIEW_PRUNE_OPACITY_BONUS = 0.35;
+const MULTI_VIEW_PRUNE_SCALE_BONUS = 0.25;
+const MULTI_VIEW_PRUNE_SCREEN_BONUS = 0.25;
+const INITIAL_SIGMA_MIN_RATIO = 0.0007;
+const INITIAL_SIGMA_MAX_RATIO = 0.007;
+const INITIAL_SIGMA_BIAS_RATIO = 0.0015;
+const TRAINING_CAMERA_NEAR = 0.01;
+const TRAINING_CAMERA_FAR = 4_000_000.0;
 
 // Training hyperparameters
 const SH_DEGREE_INTERVAL = 1000;
 
-// SH (color) update frequency - only update every N iterations
-// FastGS updates SH every 16 iterations for first 15k iters, then less
 let SH_UPDATE_INTERVAL = 16;
 
-// Learning rates (mutable for runtime adjustment)
-// Based on FastGS defaults, scaled up ~2-3x for faster convergence in 10k iterations
-// FastGS: position=0.00016, feature=0.0025, opacity=0.025, scale=0.005, rotation=0.001
 let MEANS_LR = 0.00016;    // Position
 let SHS_LR = 0.0025;       // SH/color
 let OPACITY_LR = 0.025;    // Opacity
 let SCALING_LR = 0.005;    // Scale
 let ROTATION_LR = 0.001;   // Rotation
+
+const MEANS_LR_FINAL = 0.0000016;
+const MEANS_LR_DELAY_MULT = 0.01;
+const MEANS_LR_MAX_STEPS = 30000;
 
 // Training hyperparameters interface
 export interface TrainingParams {
@@ -166,6 +177,7 @@ export default function get_renderer(
   let active_count_buffer: GPUBuffer | null = null;
   let active_count_uniform_buffer: GPUBuffer | null = null;
   let knn_num_points_buffer: GPUBuffer | null = null;
+  let knn_config_buffer: GPUBuffer | null = null;
 
   // Training forward render targets
   let training_color_texture: GPUTexture | null = null;
@@ -219,7 +231,8 @@ export default function get_renderer(
   const GEOM_GRAD_COMPONENTS = 5;
 
   // Bind Groups
-  let sort_bind_group: GPUBindGroup | null = null;
+  let sort_bind_group: GPUBindGroup | undefined;
+  let clear_keys_bind_group: GPUBindGroup | undefined;
   let sorted_bg: GPUBindGroup[] = [];
   let render_splat_bg: GPUBindGroup | null = null;
   let preprocess_bg: GPUBindGroup | null = null;
@@ -241,7 +254,113 @@ export default function get_renderer(
   let current_training_camera_index = 0;
 
   // Training images
-  let training_images: Array<{ view: GPUTextureView; sampler: GPUSampler }> = [];
+  let training_images: TrainingImageResource[] = [];
+
+  function getPreferredTrainingResolution(): { width: number; height: number } {
+    if (training_images.length > 0) {
+      const idx = Math.min(Math.max(current_training_camera_index, 0), training_images.length - 1);
+      const tex = training_images[idx];
+      if (tex && tex.width > 0 && tex.height > 0) {
+        return { width: tex.width, height: tex.height };
+      }
+    }
+    if (training_cameras.length > 0) {
+      const idx = Math.min(Math.max(current_training_camera_index, 0), training_cameras.length - 1);
+      const cam = training_cameras[idx];
+      if (cam && cam.viewport) {
+        const width = Math.max(1, Math.round(cam.viewport[0]));
+        const height = Math.max(1, Math.round(cam.viewport[1]));
+        if (width > 0 && height > 0) {
+          return { width, height };
+        }
+      }
+    }
+    return {
+      width: Math.max(1, canvas.width || 1),
+      height: Math.max(1, canvas.height || 1),
+    };
+  }
+
+  function computePositionLearningRate(iteration: number): number {
+    if (MEANS_LR <= 0 || MEANS_LR_FINAL <= 0) {
+      return MEANS_LR;
+    }
+    const step = Math.max(iteration, 0);
+    const maxSteps = Math.max(1, MEANS_LR_MAX_STEPS);
+    const t = Math.min(1.0, step / maxSteps);
+    const logLerp = Math.exp(Math.log(MEANS_LR) * (1 - t) + Math.log(MEANS_LR_FINAL) * t);
+    let delayRate = 1.0;
+    if (MEANS_LR_DELAY_MULT < 0.999) {
+      const phase = Math.min(1.0, step / Math.max(1, Math.round(0.1 * maxSteps)));
+      delayRate = MEANS_LR_DELAY_MULT + (1.0 - MEANS_LR_DELAY_MULT) * Math.sin(0.5 * Math.PI * phase);
+    }
+    return logLerp * delayRate;
+  }
+
+  function getCurrentTrainingTextureSize(): { width: number; height: number } {
+    if (training_width > 0 && training_height > 0) {
+      return { width: training_width, height: training_height };
+    }
+    return getPreferredTrainingResolution();
+  }
+
+  function ensureTrainingTargetsForCurrentView(): { width: number; height: number } {
+    const { width, height } = getPreferredTrainingResolution();
+    updateTrainingCameraForResolution(current_training_camera_index, width, height);
+    ensureTrainingRenderTargets(width, height);
+    return { width, height };
+  }
+
+  function updateTrainingCameraForResolution(cameraIndex: number, width: number, height: number): void {
+    if (cameraIndex < 0 || cameraIndex >= training_cameras.length) {
+      return;
+    }
+    const cam = training_cameras[cameraIndex];
+    const buffer = training_camera_buffers[cameraIndex];
+    if (!cam || !buffer) {
+      return;
+    }
+    const baseWidth = cam.imgSize ? cam.imgSize[0] : cam.viewport[0];
+    const baseHeight = cam.imgSize ? cam.imgSize[1] : cam.viewport[1];
+    const widthF = Math.max(1, width);
+    const heightF = Math.max(1, height);
+    if (Math.abs(widthF - baseWidth) < 1e-3 && Math.abs(heightF - baseHeight) < 1e-3) {
+      update_training_camera_uniform_buffer(device, buffer, cam);
+      return;
+    }
+    const scaleX = widthF / baseWidth;
+    const scaleY = heightF / baseHeight;
+    const baseCenterPx = cam.center_px
+      ? vec2.create(cam.center_px[0], cam.center_px[1])
+      : vec2.create(baseWidth * 0.5, baseHeight * 0.5);
+    const scaledCenterPx = vec2.create(baseCenterPx[0] * scaleX, baseCenterPx[1] * scaleY);
+    const scaledViewport = vec2.create(widthF, heightF);
+    const scaledFocal = vec2.create(cam.focal[0] * scaleX, cam.focal[1] * scaleY);
+    const [cx_ndc, cy_ndc] = principal_point_to_ndc(scaledCenterPx[0], scaledCenterPx[1], widthF, heightF);
+    const scaledCenter = vec2.create(cx_ndc, cy_ndc);
+    const proj = get_pinhole_projection_matrix(
+      TRAINING_CAMERA_NEAR,
+      TRAINING_CAMERA_FAR,
+      scaledFocal[0],
+      scaledFocal[1],
+      scaledCenterPx[0],
+      scaledCenterPx[1],
+      widthF,
+      heightF,
+    );
+    const proj_inv = mat4.inverse(proj);
+    const adjustedCamera: TrainingCameraData = {
+      ...cam,
+      proj,
+      proj_inv,
+      viewport: scaledViewport,
+      focal: scaledFocal,
+      center: scaledCenter,
+      center_px: scaledCenterPx,
+      imgSize: vec2.create(widthF, heightF),
+    };
+    update_training_camera_uniform_buffer(device, buffer, adjustedCamera);
+  }
 
   // Tiling buffers
   const TILE_SIZE = 16;
@@ -332,12 +451,12 @@ export default function get_renderer(
   let background_params_buffer: GPUBuffer | null = null;
   let tile_mask_buffer: GPUBuffer | null = null;
   let loss_params_buffer: GPUBuffer | null = null;
-let metric_image_params_buffer: GPUBuffer | null = null;
-let metric_threshold_params_buffer: GPUBuffer | null = null;
-let metric_pixel_buffer: GPUBuffer | null = null;
-let metric_flag_buffer: GPUBuffer | null = null;
-let metric_counts_buffer: GPUBuffer | null = null;
-let metric_accum_params_buffer: GPUBuffer | null = null;
+  let metric_image_params_buffer: GPUBuffer | null = null;
+  let metric_threshold_params_buffer: GPUBuffer | null = null;
+  let metric_pixel_buffer: GPUBuffer | null = null;
+  let metric_flag_buffer: GPUBuffer | null = null;
+  let metric_counts_buffer: GPUBuffer | null = null;
+  let metric_accum_params_buffer: GPUBuffer | null = null;
 
   // ===============================================
   // Buffer Creation Functions
@@ -386,8 +505,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
   function createLossParamsBuffer(): GPUBuffer {
     // Loss weights: [w_l2, w_l1, w_ssim, _pad]
-    // Original 3DGS uses: L = 0.8 * L1 + 0.2 * D-SSIM
-    // We'll use L1-heavy mix to avoid blur: w_l2=0.2, w_l1=0.8
+    // FastGS default: L = 0.8 * L1 + 0.2 * D-SSIM (no L2 term)
     const data = new Float32Array([
       0.0,  // w_l2 - FastGS uses SSIM instead
       0.8,  // w_l1
@@ -455,7 +573,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       }),
       uniform: device.createBuffer({
         label: 'active count (uniform)',
-        size: 4,
+        size: 32,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
       })
     };
@@ -469,6 +587,23 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       new Uint32Array([active_count])
     );
+  }
+
+  function updateKnnConfigBuffer(): void {
+    const data = new Float32Array([
+      sceneExtent,
+      INITIAL_SIGMA_MIN_RATIO,
+      INITIAL_SIGMA_MAX_RATIO,
+      INITIAL_SIGMA_BIAS_RATIO,
+    ]);
+    if (!knn_config_buffer) {
+      knn_config_buffer = device.createBuffer({
+        label: 'knn init config',
+        size: data.byteLength,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    }
+    device.queue.writeBuffer(knn_config_buffer, 0, data);
   }
 
   // ===============================================
@@ -691,6 +826,18 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       constants: {
         workgroupSize: WORKGROUP_SIZE,
         sortKeyPerThread: (C.histogram_wg_size * C.rs_histogram_block_rows) / WORKGROUP_SIZE,
+      },
+    },
+  });
+
+  const clear_keys_pipeline = device.createComputePipeline({
+    label: 'clear keys',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ code: commonWGSL + '\n' + preprocessWGSL }),
+      entryPoint: 'clear_keys',
+      constants: {
+        workgroupSize: WORKGROUP_SIZE,
       },
     },
   });
@@ -1047,6 +1194,13 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         { binding: 3, resource: { buffer: sorter.sort_dispatch_indirect_buffer } },
       ],
     });
+    clear_keys_bind_group = device.createBindGroup({
+      label: 'clear keys bind group',
+      layout: clear_keys_pipeline.getBindGroupLayout(2),
+      entries: [
+        { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_depths_buffer } },
+      ],
+    });
   }
 
   function rebuildSortedBG() {
@@ -1076,7 +1230,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   function rebuildPreprocessBG() {
-    if (!gaussian_buffer || !sh_buffer || !splat_buffer) return;
+    if (!gaussian_buffer || !sh_buffer || !splat_buffer || !active_count_uniform_buffer) return;
     preprocess_bg = device.createBindGroup({
       label: 'preprocess g1',
       layout: preprocess_pipeline.getBindGroupLayout(1),
@@ -1084,11 +1238,12 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         { binding: 0, resource: { buffer: gaussian_buffer } },
         { binding: 1, resource: { buffer: sh_buffer } },
         { binding: 2, resource: { buffer: splat_buffer } },
+        { binding: 3, resource: { buffer: active_count_uniform_buffer } },
       ],
     });
   }
 
-  function ensureTilingParamsBuffer() {
+  function ensureTilingParamsBuffer(width: number, height: number) {
     if (!tiling_params_buffer) {
       tiling_params_buffer = createBuffer(
         device,
@@ -1097,12 +1252,12 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       );
     }
-    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
-    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const tileWidth = Math.ceil(width / TILE_SIZE);
+    const tileHeight = Math.ceil(height / TILE_SIZE);
     const numCameras = 1;
     const params = new Uint32Array([
-      canvas.width,
-      canvas.height,
+      width,
+      height,
       TILE_SIZE,
       tileWidth,
       tileHeight,
@@ -1123,23 +1278,14 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     }
   }
 
-  function ensureIntersectionBuffers(requiredIntersections: number) {
-    // CRITICAL FIX: Do NOT destroy buffers if requiredIntersections is 0.
-    // The training loop expects these buffers to exist (be non-null) even if empty.
-    // If we destroy them, subsequent bind group updates will fail.
-
-    // We'll treat 0 intersections as a valid state that just needs minimal buffer sizes.
-    // Just ensure non-negative.
+  function ensureIntersectionBuffers(requiredIntersections: number, width: number, height: number) {
     requiredIntersections = Math.max(0, requiredIntersections);
 
-    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
-    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const tileWidth = Math.ceil(width / TILE_SIZE);
+    const tileHeight = Math.ceil(height / TILE_SIZE);
     const tileCount = tileWidth * tileHeight;
     const numCameras = 1;
     const totalTiles = tileCount * numCameras;
-
-    // Ensure buffers are never null. Use a minimum size of 4 bytes (1 u32) 
-    // to satisfy WebGPU requirements if requiredIntersections is 0.
 
     if (!isect_ids_buffer || requiredIntersections > num_intersections) {
       if (isect_ids_buffer) {
@@ -1209,6 +1355,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       knn_num_points_buffer.destroy();
     }
     knn_num_points_buffer = createKnnNumPointsBuffer();
+    updateKnnConfigBuffer();
     knn_init_bind_group = device.createBindGroup({
       label: 'knn init bind group',
       layout: knn_init_pipeline.getBindGroupLayout(0),
@@ -1216,6 +1363,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         { binding: 0, resource: { buffer: gaussian_buffer } },
         { binding: 1, resource: { buffer: knn_num_points_buffer } },
         { binding: 2, resource: { buffer: density_buffer } },
+        { binding: 3, resource: { buffer: knn_config_buffer! } },
       ]
     });
   }
@@ -1269,7 +1417,6 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       texture_view_to_use = training_images[current_training_camera_index].view;
       sampler_to_use = training_images[current_training_camera_index].sampler;
     } else if (targetTextureView && targetSampler) {
-      // Fallback: viewer camera target
       texture_view_to_use = targetTextureView;
       sampler_to_use = targetSampler;
     } else {
@@ -1287,7 +1434,6 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         { binding: 3, resource: training_alpha_view },
         { binding: 4, resource: residual_color_view },
         { binding: 5, resource: residual_alpha_view },
-        // LossParams: default to pure L2 (w_l2 = 1, w_l1 = 0).
         { binding: 6, resource: { buffer: loss_params_buffer! } },
       ],
     });
@@ -1534,7 +1680,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   function rebuildMetricAccumBindGroup() {
-    ensureTilingParamsBuffer();
+    const { width, height } = getCurrentTrainingTextureSize();
+    ensureTilingParamsBuffer(width, height);
     if (!metric_accum_pipeline || !metric_flag_buffer || !tile_offsets_buffer ||
       !flatten_ids_buffer || !gauss_projections_buffer || !training_last_ids_buffer ||
       !tiling_params_buffer || !metric_counts_buffer || !active_count_uniform_buffer) {
@@ -1547,13 +1694,13 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }
-    const pixelCount = training_width * training_height;
-    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
-    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const pixelCount = width * height;
+    const tileWidth = Math.ceil(width / TILE_SIZE);
+    const tileHeight = Math.ceil(height / TILE_SIZE);
     const totalTiles = tileWidth * tileHeight;
     const accumParams = new Uint32Array([
       pixelCount,
-      canvas.width,
+      width,
       tileWidth,
       tileHeight,
       TILE_SIZE,
@@ -1595,7 +1742,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     rebuildPruneDecideBindGroup();
   }
 
-  function run_training_tiles_projection(encoder: GPUCommandEncoder) {
+  function run_training_tiles_projection(encoder: GPUCommandEncoder, width: number, height: number) {
     if (!training_tiles_project_pipeline ||
       !gaussian_buffer ||
       !gauss_projections_buffer ||
@@ -1604,7 +1751,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       return;
     }
 
-    ensureTilingParamsBuffer();
+    ensureTilingParamsBuffer(width, height);
 
     const bindGroup = device.createBindGroup({
       label: 'training tiles project bind group',
@@ -1637,13 +1784,14 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     if (!gauss_projections_buffer) {
       return;
     }
+    const { width: trainWidth, height: trainHeight } = ensureTrainingTargetsForCurrentView();
     if (active_count === 0) {
-      ensureIntersectionBuffers(0);
+      ensureIntersectionBuffers(0, trainWidth, trainHeight);
       return;
     }
 
     const encoder = device.createCommandEncoder();
-    run_training_tiles_projection(encoder);
+    run_training_tiles_projection(encoder, trainWidth, trainHeight);
 
     const projectionsSizeBytes = active_count * GAUSS_PROJECTION_BYTES;
     const staging = device.createBuffer({
@@ -1683,8 +1831,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
     const totalIntersections = running;
 
-    const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
-    const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+    const tileWidth = Math.ceil(trainWidth / TILE_SIZE);
+    const tileHeight = Math.ceil(trainHeight / TILE_SIZE);
 
     lastTileCoverageStats = {
       numFrustumPass,
@@ -1709,14 +1857,12 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     }
     device.queue.writeBuffer(tiles_cumsum_buffer, 0, cumsum);
 
-    ensureIntersectionBuffers(totalIntersections);
+    ensureIntersectionBuffers(totalIntersections, trainWidth, trainHeight);
 
     if (totalIntersections === 0) {
-      // CORRECTION: Even with 0 intersections, we must reset tile_offsets_buffer.
-      // Otherwise it contains stale data, causing the renderer to access out-of-bounds intersections.
       if (tile_offsets_buffer) {
-        const tileWidth = Math.ceil(canvas.width / TILE_SIZE);
-        const tileHeight = Math.ceil(canvas.height / TILE_SIZE);
+        const tileWidth = Math.ceil(trainWidth / TILE_SIZE);
+        const tileHeight = Math.ceil(trainHeight / TILE_SIZE);
         const totalTiles = tileWidth * tileHeight;
         const zeroOffsets = new Uint32Array(totalTiles + 1);
         // default init is 0, which is correct for 0 intersections
@@ -1735,7 +1881,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     }
 
     const emitEncoder = device.createCommandEncoder();
-    ensureTilingParamsBuffer();
+    ensureTilingParamsBuffer(trainWidth, trainHeight);
 
     const emitBindGroup = device.createBindGroup({
       label: 'training tiles emit bind group',
@@ -1817,7 +1963,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       return;
     }
 
-    const nTiles = Math.ceil(canvas.width / TILE_SIZE) * Math.ceil(canvas.height / TILE_SIZE);
+    const nTiles = Math.ceil(trainWidth / TILE_SIZE) * Math.ceil(trainHeight / TILE_SIZE);
     const tileOffsetsInit = new Uint32Array(nTiles + 1);
     tileOffsetsInit.fill(totalIntersections);
     device.queue.writeBuffer(tile_offsets_buffer!, 0, tileOffsetsInit);
@@ -1937,6 +2083,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     if (densificationManager) {
       densificationManager.setSceneExtent(newExtent);
     }
+    updateKnnConfigBuffer();
   }
 
   // ===============================================
@@ -2027,12 +2174,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   // Pruning
   // ===============================================
 
-  /**
-   * Prune gaussians based on current training controller settings.
-   * Uses FastGS-style pruning: opacity + world-scale thresholds.
-   * @param customParams Optional custom prune params (overrides controller)
-  */
-  async function prune(customParams?: PruneParams): Promise<number> {
+  async function prune(customParams?: PruneParams, multiViewOverride?: MultiViewScores | null, baseCountOverride?: number): Promise<number> {
     if (active_count === 0) {
       return active_count;
     }
@@ -2040,12 +2182,24 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     renderingSuspended = true;
 
     try {
-      const multiView = await getMultiViewScores();
+      const multiView = multiViewOverride ?? await getMultiViewScores();
       if (!multiView || multiView.sampleCount === 0) {
         console.warn('[prune] Unable to compute multi-view scores; skipping.');
         return active_count;
       }
-      const pruned = await applyMultiViewPrune(multiView, active_count);
+      const pruneParams = customParams
+        ? customParams
+        : trainingController
+          ? trainingController.getPruneParams()
+          : {
+            minOpacity: 0.005,
+            maxScale: sceneExtent * 0.1,
+            maxScreenRadius: 10000,
+            useScreenSizePruning: false,
+          };
+
+      const baseCount = baseCountOverride ?? active_count;
+      const pruned = await applyMultiViewPrune(multiView, baseCount, pruneParams);
       if (pruned > 0) {
         console.log(`[prune] Removed ${pruned} gaussians (remaining ${active_count})`);
       } else {
@@ -2084,7 +2238,17 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
     const num = active_count;
     const num_wg = Math.ceil(num / WORKGROUP_SIZE);
+    const clearPass = encoder.beginComputePass({ label: 'clear keys' });
+    if (sorter && clear_keys_bind_group) {
+      clearPass.setPipeline(clear_keys_pipeline);
+      clearPass.setBindGroup(2, clear_keys_bind_group);
+      const capacity = sorter.ping_pong[0].sort_depths_buffer.size / 4;
+      clearPass.dispatchWorkgroups(Math.ceil(capacity / WORKGROUP_SIZE));
+    }
+    clearPass.end();
+
     const pass = encoder.beginComputePass({ label: 'preprocess' });
+
     pass.setPipeline(preprocess_pipeline);
     pass.setBindGroup(0, preprocess_bg0);
     pass.setBindGroup(1, preprocess_bg);
@@ -2095,8 +2259,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   function run_training_tiled_forward(encoder: GPUCommandEncoder) {
-    ensureTrainingRenderTargets(canvas.width, canvas.height);
-    ensureTilingParamsBuffer();
+    const { width, height } = ensureTrainingTargetsForCurrentView();
+    ensureTilingParamsBuffer(width, height);
 
     if (!training_tiles_project_pipeline) {
       console.warn('training_tiles_project_pipeline is null, cannot run tiled training forward');
@@ -2115,8 +2279,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
     const wgSizeX = 8;
     const wgSizeY = 8;
-    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
-    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+    const numGroupsX = Math.ceil(width / wgSizeX);
+    const numGroupsY = Math.ceil(height / wgSizeY);
 
     const pass = encoder.beginComputePass({ label: 'training tiled forward' });
     pass.setPipeline(training_tiled_forward_pipeline);
@@ -2126,7 +2290,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   function run_training_loss(encoder: GPUCommandEncoder) {
-    ensureTrainingRenderTargets(canvas.width, canvas.height);
+    const { width, height } = ensureTrainingTargetsForCurrentView();
     rebuildTrainingLossBG();
     if (!training_loss_bind_group) {
       console.warn('training_loss_bind_group is null, skipping training_loss dispatch');
@@ -2135,8 +2299,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
     const wgSizeX = 8;
     const wgSizeY = 8;
-    const numGroupsX = Math.ceil(canvas.width / wgSizeX);
-    const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+    const numGroupsX = Math.ceil(width / wgSizeX);
+    const numGroupsY = Math.ceil(height / wgSizeY);
 
     const pass = encoder.beginComputePass({ label: 'training loss' });
     pass.setPipeline(training_loss_pipeline);
@@ -2146,8 +2310,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   function run_training_tiled_backward(encoder: GPUCommandEncoder) {
-    ensureTrainingRenderTargets(canvas.width, canvas.height);
-    ensureTilingParamsBuffer();
+    const { width, height } = ensureTrainingTargetsForCurrentView();
+    ensureTilingParamsBuffer(width, height);
 
     const num = active_count;
     if (num === 0) {
@@ -2161,7 +2325,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     }
 
     if (useWavefrontBackward && tile_grads_buffer) {
-      run_wavefront_backward(encoder);
+      run_wavefront_backward(encoder, width, height);
     } else {
       rebuildTrainingTiledBackwardBG();
       if (!training_tiled_backward_bind_group) {
@@ -2171,8 +2335,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
       const wgSizeX = 8;
       const wgSizeY = 8;
-      const numGroupsX = Math.ceil(canvas.width / wgSizeX);
-      const numGroupsY = Math.ceil(canvas.height / wgSizeY);
+      const numGroupsX = Math.ceil(width / wgSizeX);
+      const numGroupsY = Math.ceil(height / wgSizeY);
 
       const pass = encoder.beginComputePass({ label: 'training tiled backward' });
       pass.setPipeline(training_tiled_backward_pipeline);
@@ -2182,7 +2346,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     }
   }
 
-  function run_wavefront_backward(encoder: GPUCommandEncoder) {
+  function run_wavefront_backward(encoder: GPUCommandEncoder, width: number, height: number) {
     rebuildBackwardTilesLocalBG();
     if (!backward_tiles_local_bind_group) {
       console.warn('backward_tiles_local_bind_group is null, falling back to old backward');
@@ -2191,8 +2355,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       return;
     }
 
-    const tilesX = Math.ceil(canvas.width / TILE_SIZE);
-    const tilesY = Math.ceil(canvas.height / TILE_SIZE);
+    const tilesX = Math.ceil(width / TILE_SIZE);
+    const tilesY = Math.ceil(height / TILE_SIZE);
 
     const pass1 = encoder.beginComputePass({ label: 'backward tiles local (phase 1)' });
     pass1.setPipeline(backward_tiles_local_pipeline!);
@@ -2309,13 +2473,13 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     const scale_elements = active_count * TRAIN_SCALE_COMPONENTS;
     const rot_elements = active_count * TRAIN_ROT_COMPONENTS;
 
-    const lr_means = MEANS_LR;
+    const lr_means = computePositionLearningRate(trainingIteration);
     const lr_sh = SHS_LR;
     const lr_opacity = OPACITY_LR;
     const lr_scale = SCALING_LR;
     const lr_rotation = ROTATION_LR;
 
-    // Only update SH every SH_UPDATE_INTERVAL iterations (FastGS does every 16)
+    // Only update SH every SH_UPDATE_INTERVAL iterations
     const shouldUpdateSH = (trainingIteration % SH_UPDATE_INTERVAL) === 0;
     if (sh_elements > 0 && shouldUpdateSH) {
       run_adam_on_buffer(
@@ -2450,12 +2614,10 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     // Update params buffer with dynamic visibility gating tied to densification interval
     const paramsData = densificationManager.createDensifyUniformData(active_count);
 
-    // CRITICAL FIX: Scale gradient thresholds to pixel space.
-    // The config thresholds (e.g. 0.0002) are based on NDC space (0-1).
-    // Our gradients are in pixel space (0-W), so they are ~W/2 times larger.
-    const pixelScale = canvas.width / 2.0;
-    paramsData[0] *= pixelScale; // gradThreshold
-    paramsData[1] *= pixelScale; // gradAbsThreshold
+    const referenceWidth = getCurrentTrainingTextureSize().width;
+    const pixelScale = Math.max(referenceWidth, 1) / 2.0;
+    paramsData[0] *= pixelScale;
+    paramsData[1] *= pixelScale;
 
     const interval =
       trainingController?.getConfig().densificationInterval ??
@@ -2635,34 +2797,20 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     return result;
   }
 
-  async function applyMultiViewPrune(scores: MultiViewScores, baseCount: number): Promise<number> {
+  async function applyMultiViewPrune(scores: MultiViewScores, baseCount: number, pruneParams: PruneParams): Promise<number> {
     if (!train_scale_buffer || !train_opacity_buffer) {
       return 0;
     }
     if (active_count === 0 || scores.sampleCount === 0) {
       return 0;
     }
-    const prunable = new Array<boolean>(active_count).fill(false);
+
     const opacities = await readBufferToCPU(train_opacity_buffer, active_count * FLOAT32_BYTES);
     const scales = await readBufferToCPU(train_scale_buffer, active_count * TRAIN_SCALE_COMPONENTS * FLOAT32_BYTES);
-    const minOpacity = trainingController?.getConfig().minOpacity ?? DEFAULT_TRAINING_SCHEDULE.minOpacity;
-    const scaleThreshold = sceneExtent * 0.1;
-    for (let i = 0; i < active_count; i++) {
-      const value = 1 / (1 + Math.exp(-opacities[i]));
-      if (value < minOpacity) {
-        prunable[i] = true;
-        continue;
-      }
-      const scaleBase = i * TRAIN_SCALE_COMPONENTS;
-      const maxScale = Math.max(
-        Math.exp(scales[scaleBase]),
-        Math.exp(scales[scaleBase + 1]),
-        Math.exp(scales[scaleBase + 2]),
-      );
-      if (maxScale > scaleThreshold) {
-        prunable[i] = true;
-      }
-    }
+    const statsBuffer = importanceManager?.getStatsBuffer() ?? null;
+    const stats = statsBuffer
+      ? await readBufferToCPU(statsBuffer, active_count * IMPORTANCE_STATS_STRIDE * FLOAT32_BYTES)
+      : null;
 
     const limit = Math.min(baseCount, scores.pruning.length);
     let minScore = Number.POSITIVE_INFINITY;
@@ -2674,7 +2822,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       if (val > maxScore) maxScore = val;
     }
     if (!Number.isFinite(minScore) || !Number.isFinite(maxScore)) {
-      return 0;
+      minScore = 0;
+      maxScore = 1;
     }
     const range = Math.max(1e-6, maxScore - minScore);
     const normalizedScores = new Float32Array(active_count);
@@ -2682,27 +2831,67 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       normalizedScores[i] = (scores.pruning[i] - minScore) / range;
     }
 
-    let toRemove = 0;
-    for (let i = 0; i < prunable.length; i++) {
-      if (prunable[i]) toRemove++;
-    }
-    const removeBudget = Math.floor(0.5 * toRemove);
-    if (removeBudget <= 0) {
-      return 0;
-    }
-
+    const prunable = new Array<boolean>(active_count).fill(false);
     const weights = new Float32Array(active_count);
     let totalWeight = 0;
+    let toRemove = 0;
+    const useScreenPrune = pruneParams.useScreenSizePruning && pruneParams.maxScreenRadius < 9999;
+
     for (let i = 0; i < active_count; i++) {
-      if (!prunable[i]) continue;
-      const score = normalizedScores[i];
-      const w = 1.0 / (1e-6 + (1.0 - score));
+      const opacityValue = 1 / (1 + Math.exp(-opacities[i]));
+      const lowOpacity = opacityValue < pruneParams.minOpacity;
+
+      const scaleBase = i * TRAIN_SCALE_COMPONENTS;
+      const maxScale = Math.max(
+        Math.exp(scales[scaleBase]),
+        Math.exp(scales[scaleBase + 1]),
+        Math.exp(scales[scaleBase + 2]),
+      );
+      const largeScale = maxScale > pruneParams.maxScale;
+
+      let largeScreen = false;
+      if (useScreenPrune && stats) {
+        const statBase = i * IMPORTANCE_STATS_STRIDE;
+        const screenRadius = stats[statBase + 2];
+        if (Number.isFinite(screenRadius) && screenRadius > pruneParams.maxScreenRadius) {
+          largeScreen = true;
+        }
+      }
+
+      if (!lowOpacity && !largeScale && !largeScreen) {
+        continue;
+      }
+
+      prunable[i] = true;
+      toRemove++;
+
+      let weightedScore = normalizedScores[i];
+      if (!Number.isFinite(weightedScore)) {
+        weightedScore = 0;
+      }
+      if (lowOpacity) {
+        weightedScore += MULTI_VIEW_PRUNE_OPACITY_BONUS;
+      }
+      if (largeScale) {
+        weightedScore += MULTI_VIEW_PRUNE_SCALE_BONUS;
+      }
+      if (largeScreen) {
+        weightedScore += MULTI_VIEW_PRUNE_SCREEN_BONUS;
+      }
+      weightedScore = Math.min(0.999, Math.max(0, weightedScore));
+
+      const w = 1.0 / (1e-6 + (1.0 - weightedScore));
       weights[i] = w;
       totalWeight += w;
     }
-    if (totalWeight === 0) {
+
+    if (toRemove === 0 || totalWeight === 0) {
       return 0;
     }
+
+    const maxRemovals = Math.max(1, Math.floor(baseCount * MULTI_VIEW_PRUNE_MAX_RATIO));
+    const desiredRemovals = Math.max(1, Math.floor(toRemove * MULTI_VIEW_PRUNE_RATIO));
+    const removeBudget = Math.min(toRemove, desiredRemovals, maxRemovals);
 
     const selected = new Array<boolean>(active_count).fill(false);
     for (let k = 0; k < removeBudget && totalWeight > 0; k++) {
@@ -2803,7 +2992,10 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     await syncGaussianBufferFromTrainingParams();
     rebuildAllBindGroups();
     rebuildDensifyAccumBindGroup();
+    cachedMultiViewScores = null;
+    cachedMultiViewIteration = -1;
     await rebuildTilesForCurrentCamera();
+    camera.needsPreprocess = true;
     return removeCount;
   }
 
@@ -2889,7 +3081,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   /**
-   * Build a rotation matrix from quaternion (for split position sampling)
+   * Build a rotation matrix from quaternion
    */
   function quatToMat3(q: number[]): number[][] {
     const [x, y, z, w] = q;
@@ -2946,8 +3138,6 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       };
     }
 
-    // Read all moment buffers
-    // We can run these in parallel
     const [
       opacity_m1, opacity_m2,
       pos_m1, pos_m2,
@@ -3018,7 +3208,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
    * Perform densification: clone and split gaussians based on accumulated gradients
    * This is done on CPU for simplicity - reads buffers, modifies, writes back.
    */
-  async function performDensification(): Promise<{ cloned: number; split: number }> {
+  async function performDensification(precomputedScores?: MultiViewScores | null): Promise<{ cloned: number; split: number }> {
     if (!densificationManager || active_count === 0) {
       return { cloned: 0, split: 0 };
     }
@@ -3032,7 +3222,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
         return { cloned: 0, split: 0 };
       }
 
-      const multiView = await getMultiViewScores();
+      const multiView = precomputedScores ?? await getMultiViewScores();
       if (!multiView || multiView.sampleCount === 0) {
         densificationManager.resetAccumulators(active_count);
         rebuildDensifyAccumBindGroup();
@@ -3055,12 +3245,23 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       const config = densificationManager.getConfig();
       const sizeThreshold = densificationManager.getSizeThreshold();
       const actions = new Uint32Array(active_count);
-      let cloneCount = 0;
-      let splitCount = 0;
+
+      const pixelScale = Math.max(getCurrentTrainingTextureSize().width, 1) / 2.0;
+      const gradThresholdPx = config.gradThreshold * pixelScale;
+      const gradAbsThresholdPx = config.gradAbsThreshold * pixelScale;
+      const minVisibility = Math.max(1, config.minVisibility);
+
+      interface DensifyCandidate {
+        index: number;
+        action: 1 | 2;
+        score: number;
+      }
+
+      const candidates: DensifyCandidate[] = [];
 
       for (let i = 0; i < active_count; i++) {
         const denom = gradData[i * GRAD_ACCUM_STRIDE + GRAD_ACCUM_DENOM];
-        if (denom < Math.max(1, config.minVisibility)) {
+        if (denom < minVisibility) {
           continue;
         }
 
@@ -3078,11 +3279,40 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
           continue;
         }
 
-        if (maxScale <= sizeThreshold && avgGrad >= config.gradThreshold) {
-          actions[i] = 1;
+        if (maxScale <= sizeThreshold && avgGrad >= gradThresholdPx) {
+          const normScore = gradThresholdPx > 1e-8 ? avgGrad / gradThresholdPx : avgGrad;
+          candidates.push({ index: i, action: 1, score: normScore });
+        } else if (maxScale > sizeThreshold && avgGradAbs >= gradAbsThresholdPx) {
+          const normScore = gradAbsThresholdPx > 1e-8 ? avgGradAbs / gradAbsThresholdPx : avgGradAbs;
+          candidates.push({ index: i, action: 2, score: normScore });
+        }
+      }
+
+      if (candidates.length === 0) {
+        densificationManager.resetAccumulators(active_count);
+        rebuildDensifyAccumBindGroup();
+        return { cloned: 0, split: 0 };
+      }
+
+      const maxNewGaussians = Math.max(1, Math.floor(active_count * 0.1));
+      const allowed = Math.min(maxNewGaussians, candidates.length);
+
+      if (allowed <= 0) {
+        densificationManager.resetAccumulators(active_count);
+        rebuildDensifyAccumBindGroup();
+        return { cloned: 0, split: 0 };
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+
+      let cloneCount = 0;
+      let splitCount = 0;
+      for (let c = 0; c < allowed; c++) {
+        const candidate = candidates[c];
+        actions[candidate.index] = candidate.action;
+        if (candidate.action === 1) {
           cloneCount++;
-        } else if (maxScale > sizeThreshold && avgGradAbs >= config.gradAbsThreshold) {
-          actions[i] = 2;
+        } else {
           splitCount++;
         }
       }
@@ -3209,6 +3439,8 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       device.queue.writeBuffer(train_opacity_buffer!, 0, newOpacities);
       device.queue.writeBuffer(train_sh_buffer!, 0, newSHs);
       writeAdamMoments(newMoments);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
       setActiveCount(newCount);
       importanceManager?.ensureCapacity(newCount);
       importanceManager?.resetStats(newCount);
@@ -3218,13 +3450,41 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
       densificationManager.ensureCapacity(newCount);
       densificationManager.resetAccumulators(newCount);
       rebuildDensifyAccumBindGroup();
-      const pruned = await applyMultiViewPrune(multiView, prevCount);
-      console.log(`[densify] Completed: ${prevCount} -> ${active_count} gaussians (${cloneCount} cloned, ${splitCount} split, ${pruned} pruned)`);
+
+      cachedMultiViewScores = null;
+      cachedMultiViewIteration = -1;
+
+      console.log(`[densify] Completed: ${prevCount} -> ${active_count} gaussians (${cloneCount} cloned, ${splitCount} split)`);
+
       await rebuildTilesForCurrentCamera();
+      camera.needsPreprocess = true;
+
       return { cloned: cloneCount, split: splitCount };
     } finally {
       renderingSuspended = false;
     }
+  }
+
+  async function runDensifyAndPruneCombined(): Promise<{ densified: boolean; pruned: boolean; pruneAttempted: boolean }> {
+    if (active_count === 0) {
+      return { densified: false, pruned: false, pruneAttempted: false };
+    }
+
+    const multiView = await getMultiViewScores();
+    if (!multiView || multiView.sampleCount === 0) {
+      console.warn('[densify+prune] Unable to compute multi-view scores; skipping.');
+      return { densified: false, pruned: false, pruneAttempted: false };
+    }
+
+    const baseCount = active_count;
+    const densifyResult = await performDensification(multiView);
+    const densified = densifyResult.cloned > 0 || densifyResult.split > 0;
+
+    const countBeforePrune = active_count;
+    await prune(undefined, multiView, baseCount);
+    const pruned = active_count !== countBeforePrune;
+
+    return { densified, pruned, pruneAttempted: true };
   }
 
   /**
@@ -3376,10 +3636,6 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   function trainStep(encoder: GPUCommandEncoder) {
-    // NOTE: current_training_camera_index should be set by the caller before calling trainStep
-    // This allows proper coordination with tile building which also needs the camera index
-    // All callers (train(), profiledTrainStep(), etc.) now use random selection
-
     trainingIteration++;
 
     zeroGradBuffers();
@@ -3404,7 +3660,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   async function profiledTrainStep(): Promise<void> {
-    // Random camera selection (like FastGS) instead of cycling
+    // Random camera selection instead of cycling
     if (training_camera_buffers.length > 0) {
       current_training_camera_index = Math.floor(Math.random() * training_camera_buffers.length);
     }
@@ -3507,7 +3763,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
           break;
         }
 
-        // Random camera selection (like FastGS) instead of cycling
+        // Random camera selection instead of cycling
         // This prevents bias from sequential camera ordering patterns
         const nextCameraIndex = training_camera_buffers.length > 0
           ? Math.floor(Math.random() * training_camera_buffers.length)
@@ -3536,24 +3792,25 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
         trainingIterationsCompleted = i + 1;
 
-        // Update training controller iteration (after trainStep incremented it)
+        // Update training controller iteration
         if (trainingController) {
           trainingController.setIteration(trainingIteration);
         }
 
         // Check if we should densify (clone/split based on accumulated gradients)
+        let densifyHandledPrune = false;
         if (trainingController && trainingController.shouldDensify()) {
           await device.queue.onSubmittedWorkDone();
-          const result = await performDensification();
-          if (result.cloned > 0 || result.split > 0) {
-            // Tiles need to be rebuilt after densification
+          const result = await runDensifyAndPruneCombined();
+          densifyHandledPrune = result.pruneAttempted;
+          if (result.densified || result.pruned) {
             tilesBuilt = false;
             tilesBuiltForCameraIndex = -1;
           }
         }
 
-        // Check if we should prune (based on FastGS schedule)
-        if (trainingController && trainingController.shouldPrune()) {
+        // Check if we should prune separately (only if not already done during densify)
+        if (!densifyHandledPrune && trainingController && trainingController.shouldPrune()) {
           await device.queue.onSubmittedWorkDone();
           const prevCount = active_count;
           await prune();
@@ -3604,18 +3861,9 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   // ===============================================
-  // Opacity Reset (for breaking floater dominance)
+  // Opacity Reset
   // ===============================================
 
-  /**
-   * Reset all opacity values to a maximum cap (like FastGS).
-   * This allows splats that were blocked by floaters to "compete" again.
-   * FastGS does this every 3000 iterations with a cap of 0.01 (1%).
-   * We use 10% since we don't have densification to add new splats.
-   * 
-   * CRITICAL: Also resets Adam momentum for opacity, scale, AND rotation
-   * to prevent old momentum from driving continued floater growth.
-   */
   async function resetOpacity(maxOpacity: number = 0.1): Promise<void> {
     if (!train_opacity_buffer || active_count === 0) return;
 
@@ -3651,10 +3899,6 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
 
     // Write back clamped values
     device.queue.writeBuffer(train_opacity_buffer, 0, opacityData);
-
-    // CRITICAL: We do NOT reset Adam moments anymore, per alignment with FastGS.
-    // Resetting them caused issues where splats lost their "velocity" and couldn't recover.
-    // FastGS only modifies the opacity value itself.
 
     await device.queue.onSubmittedWorkDone();
 
@@ -3805,7 +4049,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
   }
 
   // Loss weight storage
-  let currentLossWeights: LossWeights = { w_l2: 0.2, w_l1: 0.8, w_ssim: 0.0 };
+  let currentLossWeights: LossWeights = { w_l2: 0.0, w_l1: 0.8, w_ssim: 0.2 };
 
   function getLossWeights(): LossWeights {
     return { ...currentLossWeights };
@@ -3851,7 +4095,7 @@ let metric_accum_params_buffer: GPUBuffer | null = null;
     console.log(`Loaded ${cameras.length} training cameras`);
   }
 
-  function setTrainingImages(images: Array<{ view: GPUTextureView; sampler: GPUSampler }>) {
+  function setTrainingImages(images: TrainingImageResource[]) {
     training_images = images;
 
     console.log(`Loaded ${images.length} training images`);
