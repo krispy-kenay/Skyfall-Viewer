@@ -326,6 +326,9 @@ fn backward_tiles_local(
                     if (alpha_splat < MIN_ALPHA_THRESHOLD) {
                         continue;
                     }
+                    if (alpha_splat > 0.98) {
+                        continue;
+                    }
                     
                     let one_minus_alpha = max(1.0 - alpha_splat, 0.0001);
                     let T_before = T_current / one_minus_alpha;

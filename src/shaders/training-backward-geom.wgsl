@@ -292,8 +292,8 @@ fn training_backward_geom(@builtin(global_invocation_id) gid : vec3<u32>) {
     grad_scale[base_scale + 2u] += dL_dlog_sigma.z;
 
     let base_rot = idx * TRAIN_ROT_COMPONENTS;
-    grad_rotation[base_rot + 0u] += dL_dq.w;
-    grad_rotation[base_rot + 1u] += dL_dq.x;
-    grad_rotation[base_rot + 2u] += dL_dq.y;
-    grad_rotation[base_rot + 3u] += dL_dq.z;
+    grad_rotation[base_rot + 0u] += dL_dq.x;
+    grad_rotation[base_rot + 1u] += dL_dq.y;
+    grad_rotation[base_rot + 2u] += dL_dq.z;
+    grad_rotation[base_rot + 3u] += dL_dq.w;
 }

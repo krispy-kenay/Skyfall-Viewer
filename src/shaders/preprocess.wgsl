@@ -20,15 +20,15 @@ struct SortInfos {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> settings: RenderSettings;
+struct PreprocessParams {
+    active_count : u32,
+    _pad0 : vec3<u32>,
+};
+
 @group(1) @binding(0) var<storage, read> gaussians : array<Gaussian>;
 @group(1) @binding(1) var<storage, read> sh_buffer : array<u32>;
 @group(1) @binding(2) var<storage, read_write> splats : array<Splat>;
-
-struct DebugProj {
-    pos_cam : vec4<f32>,
-    clip    : vec4<f32>,
-};
-@group(1) @binding(3) var<storage, read_write> debug_proj : array<DebugProj>;
+@group(1) @binding(3) var<uniform> preprocess_params : PreprocessParams;
 
 //TODO: bind your data here
 @group(2) @binding(0)
@@ -117,8 +117,7 @@ fn quat_to_mat3(q: vec4<f32>) -> mat3x3<f32> {
 fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) wgs: vec3<u32>) {
     let idx = gid.x;
     //TODO: set up pipeline as described in instruction
-    let num = arrayLength(&gaussians);
-    if (idx >= num) { return; }
+    if (idx >= preprocess_params.active_count) { return; }
 
     // Unpacking
     let g = gaussians[idx];
@@ -135,13 +134,6 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let viewZ = -position_camera.z;
     var position_clip = camera.proj * position_camera;
     position_clip /= position_clip.w;
-
-    // Debug: record camera-space and clip-space positions for the first few gaussians
-    let max_debug = 32u;
-    if (idx < max_debug) {
-        debug_proj[idx].pos_cam = position_camera;
-        debug_proj[idx].clip = position_clip;
-    }
 
     if (abs(position_clip.x) > 1.2 || abs(position_clip.y) > 1.2 || position_camera.z < 0.0) {
         return;
@@ -220,4 +212,11 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     if ((visIdx % keys_per_dispatch) == 0u) {
         _ = atomicAdd(&sort_dispatch.dispatch_x, 1u);
     }
+}
+
+@compute @workgroup_size(workgroupSize, 1, 1)
+fn clear_keys(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&sort_depths)) { return; }
+    sort_depths[idx] = 0xFFFFFFFFu;
 }
