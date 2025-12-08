@@ -121,7 +121,7 @@ Implementation: per-thread compute checks `sigmoid(p02.y)` and atomically writes
 
 New gaussians are emitted into output buffers via atomic counters and can be merged into the main buffers by the renderer after the densify pass completes.
 
-## Tile-Based Depth Sorting
+## Tile-based depth sorting
 The Gaussian splat viewer features **tile-based depth sorting**, which improves rendering performance on large point clouds by organizing Gaussian splats into screen-space tiles and sorting per-tile, reducing memory bandwidth and improving cache locality.
 
 <table>
