@@ -8,7 +8,7 @@ This repository contains an interactive viewer and a 3D Gaussian Splat (3DGS) re
 ## Demo
 
 <div style="text-align:center;">
-	<img src="./images/training.gif" style="width:80%; height:auto; max-width:100%;">
+	<img src="./images/current_training.gif" style="width:80%; height:auto; max-width:100%;">
 </div>
 
 ## Rendering Pipeline
