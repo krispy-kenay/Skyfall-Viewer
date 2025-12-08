@@ -2,6 +2,7 @@ import type { PointCloud } from '../utils/load';
 import { Pane } from 'tweakpane';
 import * as TweakpaneFileImportPlugin from 'tweakpane-plugin-file-import';
 import { default as get_renderer_gaussian, GaussianRenderer, TrainingParams, LossWeights } from './gaussian-renderer';
+import { default as get_renderer_gaussian_tile, GaussianTileAwareRenderer } from './gaussian-renderer-tile';
 import { default as get_renderer_pointcloud } from './point-cloud-renderer';
 import { Camera, TrainingCameraData } from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
@@ -22,8 +23,9 @@ export default async function init(
   let isBenchmarking = false;
   let benchmarkSum = 0;
   let benchmarkFrames = 0;
-  let renderers: { pointcloud?: Renderer, gaussian?: Renderer } = {};
+  let renderers: { pointcloud?: Renderer, gaussian?: Renderer, gaussian_tile?: Renderer; } = {};
   let gaussian_renderer: GaussianRenderer | undefined;
+  let gaussian_tile_renderer: GaussianTileAwareRenderer | undefined; 
   let pointcloud_renderer: Renderer | undefined;
   let renderer: Renderer | undefined;
   let training_cameras_cache: TrainingCameraData[] = [];
@@ -50,6 +52,7 @@ export default async function init(
   const params = {
     fps: 0.0,
     gaussian_multiplier: 1,
+    tile_size: 16,
     renderer: 'pointcloud',
     benchFrames: 300,
   };
@@ -83,10 +86,12 @@ export default async function init(
 
         pointcloud_renderer = get_renderer_pointcloud(dataset.pointCloud, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer = get_renderer_gaussian(dataset.pointCloud, device, presentation_format, camera.uniform_buffer, canvas, camera);
+        gaussian_tile_renderer = get_renderer_gaussian_tile(dataset.pointCloud, device, presentation_format, camera.uniform_buffer, canvas, camera);
         (window as any).gaussian_renderer = gaussian_renderer;
         renderers = {
           pointcloud: pointcloud_renderer,
           gaussian: gaussian_renderer,
+          gaussian_tile: gaussian_tile_renderer,
         };
         renderer = renderers[params.renderer];
 
@@ -118,6 +123,7 @@ export default async function init(
       options: {
         pointcloud: 'pointcloud',
         gaussian: 'gaussian',
+        gaussian_tile: 'gaussian_tile',
       }
     }).on('change', (e) => {
       renderer = renderers[e.value];

@@ -121,6 +121,25 @@ Implementation: per-thread compute checks `sigmoid(p02.y)` and atomically writes
 
 New gaussians are emitted into output buffers via atomic counters and can be merged into the main buffers by the renderer after the densify pass completes.
 
+## Tile-Based Depth Sorting
+The Gaussian splat viewer features **tile-based depth sorting**, which improves rendering performance on large point clouds by organizing Gaussian splats into screen-space tiles and sorting per-tile, reducing memory bandwidth and improving cache locality.
+
+<table>
+  <tr>
+    <td><img src="./images/sorting2.webp" style="max-width:100%"></td>
+    <td><img src="./images/sorting1.webp" style="max-width:90%"></td>
+  </tr>
+</table>
+
+Implementation: a compute-based pipeline that:
+1. For each Gaussian, determines which tiles it overlaps using its 2D projection and splat radius.
+2. Generates key-value pairs `(tile_id | depth, gaussian_id)` for each Gaussian-tile intersection using atomic operations to avoid write conflicts.
+3. Sorts these pairs globally using radix sort.
+4. Identifies start/end ranges for each tile via a second compute pass.
+5. During rendering, tiles can be rasterized in any order with per-tile depth ordering.
+
+Trade-offs: This approach reduces per-frame fragment shader overdraw in theory but adds preprocessing overhead. For scenes with significant depth complexity and overlapping splats per tile, this can improve performance. For scenes with sparse or well-distributed splats, the overhead may outweigh the benefits.
+
 ## Build instructions
 
 1) Download [Node.js](https://nodejs.org/en/download)
