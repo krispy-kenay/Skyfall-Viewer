@@ -31,12 +31,14 @@ fn sampleTarg(coord: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
 }
 
 fn computeSSIMGrad(center: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
+    // Compute SSIM using 11x11 window (matches PyTorch reference)
     var mu_x = vec3<f32>(0.0);
     var mu_y = vec3<f32>(0.0);
-    let window_size = 11;  // Match reference implementation
+    let window_size = 11;
     let half_window = 5;
     let n = f32(window_size * window_size);
 
+    // Compute local means (via box filter approximation of Gaussian)
     for (var dy = -half_window; dy <= half_window; dy = dy + 1) {
         for (var dx = -half_window; dx <= half_window; dx = dx + 1) {
             let coord = center + vec2<i32>(dx, dy);
@@ -47,6 +49,7 @@ fn computeSSIMGrad(center: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
     mu_x = mu_x / n;
     mu_y = mu_y / n;
 
+    // Compute local variances and covariance
     var sigma_x2 = vec3<f32>(0.0);
     var sigma_y2 = vec3<f32>(0.0);
     var sigma_xy = vec3<f32>(0.0);
@@ -67,23 +70,44 @@ fn computeSSIMGrad(center: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
     sigma_y2 = sigma_y2 / n;
     sigma_xy = sigma_xy / n;
 
-    let num1 = 2.0 * mu_x * mu_y + C1;
-    let num2 = 2.0 * sigma_xy + C2;
-    let den1 = mu_x * mu_x + mu_y * mu_y + C1;
-    let den2 = sigma_x2 + sigma_y2 + C2;
+    // SSIM formula: ((2*mu_x*mu_y + C1) * (2*sigma_xy + C2)) / ((mu_x^2 + mu_y^2 + C1) * (sigma_x^2 + sigma_y^2 + C2))
+    let luminance_num = 2.0 * mu_x * mu_y + C1;
+    let luminance_den = mu_x * mu_x + mu_y * mu_y + C1;
+    let contrast_num = 2.0 * sigma_xy + C2;
+    let contrast_den = sigma_x2 + sigma_y2 + C2;
 
-    let ssim = (num1 * num2) / (den1 * den2);
-
-    // Compute approximate gradient for D-SSIM
-    // that captures the main behavior: pushing pred toward targ in SSIM-weighted manner
     let pred = samplePred(center, dims);
     let targ = sampleTarg(center, dims);
 
-    // Weight by (1 - ssim) to emphasize regions with low structural similarity
-    let dssim = vec3<f32>(1.0) - ssim;
-    let grad_ssim = dssim * (pred - targ);
+    // Compute gradient of (1 - SSIM) loss using chain rule approximation
+    // This is a simplified gradient that works reasonably well in practice
+    // Full analytical gradient involves complex chain rule through all statistics
 
-    return grad_ssim;
+    // dL/dSSIM for loss = (1 - SSIM) is simply -1
+    // Now we need dSSIM/dpred
+
+    // Approximate gradient based on local statistics and pixel difference
+    // This captures the main gradient behavior without full analytical derivation
+    let ssim_val = (luminance_num * contrast_num) / (luminance_den * contrast_den);
+
+    // Gradient contribution from luminance term (∂SSIM/∂μ_x affects all pixels in window)
+    let dL_dmu_x = -2.0 * (mu_y * luminance_den - luminance_num * mu_x) / (luminance_den * luminance_den);
+    let grad_from_mean = dL_dmu_x * contrast_num / contrast_den / n;
+
+    // Gradient contribution from variance/covariance terms
+    let pred_centered = pred - mu_x;
+    let targ_centered = targ - mu_y;
+
+    // ∂σ_xy/∂pred_pixel ≈ (targ - μ_y) / n
+    let dL_dsigma_xy = -2.0 * luminance_num / luminance_den / contrast_den;
+    let grad_from_cov = dL_dsigma_xy * targ_centered / n;
+
+    // ∂σ_x^2/∂pred_pixel ≈ 2*(pred - μ_x) / n
+    let dL_dsigma_x2 = luminance_num * contrast_num * (-1.0) / (luminance_den * contrast_den * contrast_den);
+    let grad_from_var = dL_dsigma_x2 * 2.0 * pred_centered / n;
+
+    // Total gradient (negative because we minimize 1-SSIM)
+    return -(grad_from_mean + grad_from_cov + grad_from_var);
 }
 
 @compute @workgroup_size(8, 8, 1)

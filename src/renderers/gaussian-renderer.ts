@@ -283,7 +283,7 @@ export default function get_renderer(
 
   function computePositionLearningRate(iteration: number): number {
     if (MEANS_LR <= 0 || MEANS_LR_FINAL <= 0) {
-      return MEANS_LR;
+      return MEANS_LR * sceneExtent;  
     }
     const step = Math.max(iteration, 0);
     const maxSteps = Math.max(1, MEANS_LR_MAX_STEPS);
@@ -294,7 +294,7 @@ export default function get_renderer(
       const phase = Math.min(1.0, step / Math.max(1, Math.round(0.1 * maxSteps)));
       delayRate = MEANS_LR_DELAY_MULT + (1.0 - MEANS_LR_DELAY_MULT) * Math.sin(0.5 * Math.PI * phase);
     }
-    return logLerp * delayRate;
+    return logLerp * delayRate * sceneExtent;
   }
 
   function getCurrentTrainingTextureSize(): { width: number; height: number } {
@@ -505,11 +505,11 @@ export default function get_renderer(
 
   function createLossParamsBuffer(): GPUBuffer {
     // Loss weights: [w_l2, w_l1, w_ssim, _pad]
-    // FastGS default: L = 0.8 * L1 + 0.2 * D-SSIM (no L2 term)
+    // Using L1 + D-SSIM (reference default: 0.8*L1 + 0.2*DSSIM)
     const data = new Float32Array([
-      0.0,  // w_l2 - FastGS uses SSIM instead
+      0.0,  // w_l2
       0.8,  // w_l1
-      0.2,  // w_ssim - FastGS default
+      0.2,  // w_ssim - now with proper gradient approximation
       0.0,
     ]);
     return createBuffer(
@@ -4049,6 +4049,7 @@ export default function get_renderer(
   }
 
   // Loss weight storage
+  // L1 + D-SSIM combination (reference default: 0.8*L1 + 0.2*DSSIM)
   let currentLossWeights: LossWeights = { w_l2: 0.0, w_l1: 0.8, w_ssim: 0.2 };
 
   function getLossWeights(): LossWeights {
