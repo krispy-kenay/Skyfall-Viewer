@@ -11,6 +11,15 @@
 const MAX_SH_COEFFS : u32 = 16u;
 const SH_COMPONENTS : u32 = MAX_SH_COEFFS * 3u;
 
+fn sigmoid(x: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+fn inverse_sigmoid(y: f32) -> f32 {
+    let y_clamped = clamp(y, 0.0001, 0.9999);
+    return log(y_clamped / (1.0 - y_clamped));
+}
+
 fn read_f16_coeff(base_word: u32, elem: u32) -> f32 {
     let word_idx = base_word + (elem >> 1u);
     let halves   = unpack2x16float(sh_buffer[word_idx]);
@@ -42,7 +51,8 @@ fn training_init_params(@builtin(global_invocation_id) gid : vec3<u32>) {
     let g = gaussians[idx];
     let p02 = unpack2x16float(g.pos_opacity[1u]);
 
-    train_opacity[idx] = p02.y;
+    // Store opacity in inverse sigmoid space for proper gradient flow
+    train_opacity[idx] = inverse_sigmoid(p02.y);
 
     // ---- Initialize position (world space) ----
     let p01 = unpack2x16float(g.pos_opacity[0u]);
@@ -109,7 +119,8 @@ fn training_apply_params(@builtin(global_invocation_id) gid : vec3<u32>) {
     r02.y = train_rotation[base_rot + 2u];
     r01.x = train_rotation[base_rot + 3u];
 
-    p02.y = train_opacity[idx];
+    // Convert opacity from inverse sigmoid space back to [0,1]
+    p02.y = sigmoid(train_opacity[idx]);
 
     g.pos_opacity[0u] = pack2x16float(p01);
     g.pos_opacity[1u] = pack2x16float(p02);

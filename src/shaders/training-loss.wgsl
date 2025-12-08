@@ -33,10 +33,10 @@ fn sampleTarg(coord: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
 fn computeSSIMGrad(center: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
     var mu_x = vec3<f32>(0.0);
     var mu_y = vec3<f32>(0.0);
-    let window_size = 5;
-    let half_window = 2;
+    let window_size = 11;  // Match reference implementation
+    let half_window = 5;
     let n = f32(window_size * window_size);
-    
+
     for (var dy = -half_window; dy <= half_window; dy = dy + 1) {
         for (var dx = -half_window; dx <= half_window; dx = dx + 1) {
             let coord = center + vec2<i32>(dx, dy);
@@ -46,11 +46,11 @@ fn computeSSIMGrad(center: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
     }
     mu_x = mu_x / n;
     mu_y = mu_y / n;
-    
+
     var sigma_x2 = vec3<f32>(0.0);
     var sigma_y2 = vec3<f32>(0.0);
     var sigma_xy = vec3<f32>(0.0);
-    
+
     for (var dy = -half_window; dy <= half_window; dy = dy + 1) {
         for (var dx = -half_window; dx <= half_window; dx = dx + 1) {
             let coord = center + vec2<i32>(dx, dy);
@@ -66,20 +66,23 @@ fn computeSSIMGrad(center: vec2<i32>, dims: vec2<u32>) -> vec3<f32> {
     sigma_x2 = sigma_x2 / n;
     sigma_y2 = sigma_y2 / n;
     sigma_xy = sigma_xy / n;
-    
+
     let num1 = 2.0 * mu_x * mu_y + C1;
     let num2 = 2.0 * sigma_xy + C2;
     let den1 = mu_x * mu_x + mu_y * mu_y + C1;
     let den2 = sigma_x2 + sigma_y2 + C2;
-    
+
     let ssim = (num1 * num2) / (den1 * den2);
-    
+
+    // Compute approximate gradient for D-SSIM
+    // that captures the main behavior: pushing pred toward targ in SSIM-weighted manner
     let pred = samplePred(center, dims);
     let targ = sampleTarg(center, dims);
-    let dssim = (vec3<f32>(1.0) - ssim) * 0.5;
-    
+
+    // Weight by (1 - ssim) to emphasize regions with low structural similarity
+    let dssim = vec3<f32>(1.0) - ssim;
     let grad_ssim = dssim * (pred - targ);
-    
+
     return grad_ssim;
 }
 

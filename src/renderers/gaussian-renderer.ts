@@ -2420,7 +2420,7 @@ export default function get_renderer(
 
     const beta1 = 0.9;
     const beta2 = 0.999;
-    const eps = 1e-8;
+    const eps = 1e-15;  // Match reference implementation for proper gradient sensitivity
 
     const t = Math.max(1, adam_step_counter);
     const bias_correction1 = 1.0 - Math.pow(beta1, t);
